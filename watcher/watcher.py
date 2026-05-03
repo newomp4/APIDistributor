@@ -148,22 +148,27 @@ def upload_media(s: Settings, file_path: Path) -> dict:
     return {"id": media_id, "name": file_path.name}
 
 
-def post_now(
+def post_to_postbridge(
     s: Settings,
     social_account_id: int,
     media_id: str,
     caption: str,
     title: str,
+    scheduled_at: datetime | None = None,
 ) -> dict:
-    """Fire a type=now post to Post Bridge."""
-    payload = {
+    """Send a post to Post Bridge. If `scheduled_at` is None, posts immediately
+    (type=now); otherwise schedules at that UTC datetime."""
+    payload: dict = {
         "caption": caption,
         "social_accounts": [int(social_account_id)],
         "media": [media_id],
-        "platform_configurations": {
-            "youtube": {"title": title},
-        },
+        "platform_configurations": {"youtube": {"title": title}},
     }
+    if scheduled_at is not None:
+        payload["scheduled_at"] = (
+            scheduled_at.astimezone(timezone.utc)
+            .strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        )
     r = requests.post(
         f"{s.api_url}/posts",
         headers={**auth_headers(s), "Content-Type": "application/json"},
@@ -176,6 +181,11 @@ def post_now(
         )
         r.raise_for_status()
     return r.json()
+
+
+# Backwards-compatible alias
+def post_now(s, social_account_id, media_id, caption, title):
+    return post_to_postbridge(s, social_account_id, media_id, caption, title, None)
 
 
 def fetch_post_results(s: Settings, post_id: str) -> list[dict]:
@@ -650,6 +660,75 @@ def discover_and_upload(
     return uploaded
 
 
+def preschedule_upcoming(
+    s: Settings, state: dict, config: dict,
+    account: dict, channel_name: str,
+) -> int:
+    """For each unfired video whose slot falls within the prescheduling window,
+    send it to Post Bridge with scheduled_at=slot_time. Once submitted, Post
+    Bridge fires the upload from their cloud at the exact time — your Mac can
+    be asleep or off during the window without missing posts.
+
+    Set `prescheduling_window_hours: 0` in config to disable.
+    """
+    window_hours = config.get("prescheduling_window_hours", 8)
+    try:
+        window = timedelta(hours=float(window_hours))
+    except (TypeError, ValueError):
+        window = timedelta(hours=8)
+    if window.total_seconds() <= 0:
+        return 0
+
+    now_utc = datetime.now(timezone.utc)
+    cutoff = now_utc + window
+    submitted = 0
+    for v in state["videos"]:
+        if v.get("fired") or v.get("post_id"):
+            continue
+        try:
+            slot_utc = parse_iso(v["scheduled_for"], get_schedule_tz(config)).astimezone(timezone.utc)
+        except (KeyError, ValueError):
+            continue
+        if slot_utc > cutoff:
+            continue  # too far in future, wait
+        if slot_utc < now_utc - timedelta(minutes=1):
+            continue  # already past, fire_due_slots / rebalance handle it
+        media = v.get("media") or {}
+        media_id = media.get("id")
+        if not media_id:
+            continue
+        try:
+            log.info(
+                "[%s] pre-scheduling '%s' for %s (in %s)",
+                channel_name, v["title"], slot_utc.isoformat(),
+                slot_utc - now_utc,
+            )
+            response = post_to_postbridge(
+                s,
+                social_account_id=int(account["id"]),
+                media_id=media_id,
+                caption=v.get("description", ""),
+                title=v["title"],
+                scheduled_at=slot_utc,
+            )
+            v["fired"] = True
+            v["prescheduled"] = True
+            v["fired_at"] = now_utc.isoformat().replace("+00:00", "Z")
+            try:
+                v["post_id"] = response.get("id") or response.get("data", {}).get("id")
+            except Exception:
+                pass
+            submitted += 1
+            time.sleep(1)
+        except requests.HTTPError as e:
+            log.error(
+                "[%s] pre-schedule failed for '%s': %s",
+                channel_name, v.get("title", "?"), e,
+            )
+            return submitted
+    return submitted
+
+
 def cleanup_published(
     s: Settings, state: dict, config: dict, channel_dir: Path, channel_name: str,
 ) -> int:
@@ -755,6 +834,11 @@ def process_channel(
     state = load_state(channel_dir)
 
     if rebalance_overdue(state, config, channel_dir.name):
+        save_state(channel_dir, state)
+
+    # Pre-schedule rolling window FIRST so Post Bridge has them queued; then
+    # fire any that are due RIGHT NOW (catches up if watcher was offline).
+    if preschedule_upcoming(s, state, config, account, channel_dir.name):
         save_state(channel_dir, state)
 
     if fire_due_slots(s, state, config, account, channel_dir.name):

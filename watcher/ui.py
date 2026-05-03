@@ -11,7 +11,7 @@ import json
 import os
 import re
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -474,6 +474,7 @@ def channel_detail(name: str):
       <span class="pill {pill_overdue}"><span class="dot"></span>{stats['overdue']} overdue</span>
       <span style="margin-left:14px;" class="muted">Next: <strong>{stats['next_slot'] or '—'}</strong></span>
       <span class="nav-spacer"></span>
+      <a class="btn ghost" href="/channel/{name}/calendar">📅 Calendar</a>
       <a class="btn ghost" href="/channel/{name}/variants">Variants ({variants_summary})</a>
     </div>
 
@@ -699,6 +700,93 @@ def fire_now(name: str, idx: int):
     state["videos"][idx]["scheduled_for"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     write_state(channel_dir, state)
     return redirect(url_for("channel_detail", name=name))
+
+
+@app.route("/channel/<name>/calendar")
+def channel_calendar(name: str):
+    if not safe_name(name):
+        abort(400)
+    _, config, state = load_channel(name)
+    sched = config.get("schedule", {})
+    tz = ZoneInfo(sched.get("timezone", "UTC"))
+    days_ahead = int(request.args.get("days", "14"))
+    today = datetime.now(tz).date()
+
+    # Bucket every video by local date
+    buckets: dict = {}
+    for v in state.get("videos", []):
+        try:
+            slot = datetime.fromisoformat(v["scheduled_for"].replace("Z", "+00:00")).astimezone(tz)
+        except (KeyError, ValueError):
+            continue
+        buckets.setdefault(slot.date(), []).append((slot, v))
+
+    days_html = ""
+    for offset in range(days_ahead):
+        day = today + timedelta(days=offset)
+        day_videos = sorted(buckets.get(day, []), key=lambda iv: iv[0])
+        date_str = day.strftime("%a · %b %-d")
+        if offset == 0:
+            date_str = f"Today · {day.strftime('%b %-d')}"
+        elif offset == 1:
+            date_str = f"Tomorrow · {day.strftime('%b %-d')}"
+
+        rows_html = ""
+        if not day_videos:
+            rows_html = '<div class="cal-empty">— no posts scheduled —</div>'
+        else:
+            for slot, v in day_videos:
+                if v.get("published_url"):
+                    pill = f'<a class="pill ok" href="{html_escape(v["published_url"])}" target="_blank" rel="noopener" style="text-decoration:none;"><span class="dot"></span>posted ▶</a>'
+                elif v.get("publish_failed"):
+                    pill = '<span class="pill err"><span class="dot"></span>failed</span>'
+                elif v.get("prescheduled"):
+                    pill = '<span class="pill ok"><span class="dot"></span>queued in PB</span>'
+                elif v.get("fired"):
+                    pill = '<span class="pill ok"><span class="dot"></span>sent</span>'
+                else:
+                    pill = '<span class="pill warn"><span class="dot"></span>queued</span>'
+                rows_html += f"""
+                <div class="cal-row">
+                  <div class="cal-time">{slot.strftime('%-I:%M %p')}</div>
+                  <div class="cal-title">{html_escape(v.get('title', v.get('filename','?')))}</div>
+                  <div>{pill}</div>
+                </div>
+                """
+        days_html += f"""
+        <div class="cal-day">
+          <div class="cal-day-head">{date_str}</div>
+          {rows_html}
+        </div>
+        """
+
+    cal_css = """
+    <style>
+      .cal-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
+      .cal-day { background: var(--bg-2); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+      .cal-day-head { font-weight: 600; font-size: 13px; margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid var(--border); color: var(--text); }
+      .cal-row { display: grid; grid-template-columns: 64px 1fr auto; gap: 10px; align-items: center; padding: 6px 0; font-size: 13px; }
+      .cal-row + .cal-row { border-top: 1px solid var(--border); }
+      .cal-time { color: var(--text-2); font-family: ui-monospace, monospace; font-size: 12px; }
+      .cal-title { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .cal-empty { color: var(--text-3); font-size: 12px; padding: 6px 0; }
+    </style>
+    """
+    body = f"""
+    {cal_css}
+    <a href="/channel/{name}" class="muted">← {html_escape(name)}</a>
+    <div class="row spread" style="margin-top:10px;">
+      <h1 style="margin:0;">Calendar</h1>
+      <div class="row">
+        <a class="btn tiny ghost{(' active' if days_ahead==7 else '')}" href="?days=7">7 days</a>
+        <a class="btn tiny ghost{(' active' if days_ahead==14 else '')}" href="?days=14">14 days</a>
+        <a class="btn tiny ghost{(' active' if days_ahead==30 else '')}" href="?days=30">30 days</a>
+      </div>
+    </div>
+    <p class="subhead">Times shown in <strong>{sched.get('timezone','UTC')}</strong>. <strong>Queued in PB</strong> = already pre-scheduled in Post Bridge — fires from their cloud even if your Mac is off.</p>
+    <div class="cal-grid">{days_html}</div>
+    """
+    return render(f"{name} — Calendar", body)
 
 
 @app.route("/channel/<name>/reschedule-all", methods=["POST"])
