@@ -37,3 +37,18 @@ youtube:
   # The rest of the description.
   description: |
     Subscribe for more!
+
+  # ------------------------------------------------------------------
+  # Optional variants: when present, watcher picks one at random per video.
+  # Easiest way to populate: open the channel's Variants page in the UI,
+  # copy the AI prompt, paste into ChatGPT/Claude, paste output back.
+  # ------------------------------------------------------------------
+  # description_variants:
+  #   - "First description text..."
+  #   - "Second description text..."
+  # pinned_message_variants:
+  #   - "👇 Earn money making videos like this 👇"
+  #   - "🚀 Start your side hustle today"
+  # title_template_variants:
+  #   - "{smart_title} | Daily Facts"
+  #   - "{smart_title} — Did You Know?"

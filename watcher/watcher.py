@@ -30,6 +30,7 @@ Per-channel config.yaml:
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import sys
@@ -291,6 +292,16 @@ def title_from_template(template: str, file_path: Path, smart: str) -> str:
     return title
 
 
+def pick_variant(variants: list[str] | None, fallback: str = "") -> str:
+    """Return a random non-empty variant if any are present, else fallback."""
+    if not variants:
+        return fallback
+    cleaned = [v.strip() for v in variants if isinstance(v, str) and v.strip()]
+    if not cleaned:
+        return fallback
+    return random.choice(cleaned)
+
+
 def load_sidecar(video: Path) -> dict | None:
     sidecar = video.with_suffix(".json")
     if not sidecar.exists():
@@ -323,16 +334,68 @@ def is_file_stable(path: Path) -> bool:
         return False
 
 
-def build_caption(config: dict, sidecar_description: str | None) -> str:
-    """Compose the YouTube description. If pinned_message is set in config,
-    prepend it (acts as the visible-above-the-fold first line)."""
+def build_caption(
+    config: dict, sidecar_description: str | None,
+) -> tuple[str, dict]:
+    """Compose the YouTube description.
+
+    If `description_variants` / `pinned_message_variants` are set in the
+    youtube config, picks one at random; otherwise falls back to the single
+    `description` / `pinned_message`. Sidecar always wins for the body.
+
+    Returns (caption_text, choice_metadata) so we can record which variant
+    was used in _state.json.
+    """
     yt = config.get("youtube", {})
-    pinned = yt.get("pinned_message", "").strip()
-    body = (sidecar_description if sidecar_description is not None
-            else yt.get("description", "")).strip()
+    chose: dict = {}
+
+    if sidecar_description is not None:
+        body = sidecar_description.strip()
+    elif yt.get("description_variants"):
+        body = pick_variant(yt["description_variants"], yt.get("description", ""))
+        if body:
+            try:
+                chose["description_variant_index"] = list(yt["description_variants"]).index(body)
+            except ValueError:
+                pass
+    else:
+        body = yt.get("description", "").strip()
+
+    if yt.get("pinned_message_variants"):
+        pinned = pick_variant(yt["pinned_message_variants"], yt.get("pinned_message", ""))
+        if pinned:
+            try:
+                chose["pinned_variant_index"] = list(yt["pinned_message_variants"]).index(pinned)
+            except ValueError:
+                pass
+    else:
+        pinned = yt.get("pinned_message", "").strip()
+
+    pinned = pinned.strip()
+    body = body.strip()
     if pinned and body:
-        return f"{pinned}\n\n{body}"
-    return pinned or body
+        return f"{pinned}\n\n{body}", chose
+    return (pinned or body), chose
+
+
+def build_title(
+    config: dict, file_path: Path, smart: str, sidecar_title: str | None,
+) -> tuple[str, dict]:
+    """Pick a title — sidecar > variants > template. Returns (title, choice)."""
+    yt = config.get("youtube", {})
+    chose: dict = {}
+    if sidecar_title:
+        return sidecar_title, chose
+    variants = yt.get("title_template_variants")
+    if variants:
+        chosen_template = pick_variant(variants, yt.get("title_template", "{smart_title}"))
+        title = title_from_template(chosen_template, file_path, smart)
+        try:
+            chose["title_template_variant_index"] = list(variants).index(chosen_template)
+        except ValueError:
+            pass
+        return title, chose
+    return title_from_template(yt.get("title_template", "{smart_title}"), file_path, smart), chose
 
 
 # -------------------- Per-channel pipeline --------------------
@@ -473,8 +536,6 @@ def discover_and_upload(
         return 0
 
     seen = {v["filename"] for v in state["videos"]}
-    yt = config.get("youtube", {})
-    title_template = yt.get("title_template", "{smart_title}")
     uploaded = 0
 
     for video in videos:
@@ -487,8 +548,9 @@ def discover_and_upload(
 
         smart = extract_smart_title(video)
         sidecar = load_sidecar(video) or {}
-        title = sidecar.get("title") or title_from_template(title_template, video, smart)
-        description = build_caption(config, sidecar.get("description"))
+        title, title_choice = build_title(config, video, smart, sidecar.get("title"))
+        description, desc_choice = build_caption(config, sidecar.get("description"))
+        variant_choices = {**title_choice, **desc_choice}
 
         try:
             slot = first_slot_for_new_video(config, state)
@@ -522,6 +584,7 @@ def discover_and_upload(
             "filename": video.name,
             "title": title,
             "description": description,
+            "variants_used": variant_choices,
             "scheduled_for": slot.astimezone(timezone.utc)
             .isoformat().replace("+00:00", "Z"),
             "fired": False,
