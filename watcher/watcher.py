@@ -537,13 +537,20 @@ def find_videos(folder: Path) -> list[Path]:
 
 
 def is_file_stable(path: Path) -> bool:
+    """Returns True if the file looks fully written. Short-circuits for files
+    that haven't been modified in the last 30 seconds (the common case);
+    falls back to a 2-second size-stability check for fresh files."""
     try:
-        first = path.stat().st_size
+        st = path.stat()
     except FileNotFoundError:
         return False
-    time.sleep(5)
+    # If mtime is more than 30s old, the file isn't being actively written.
+    if time.time() - st.st_mtime > 30:
+        return True
+    first_size = st.st_size
+    time.sleep(2)
     try:
-        return path.stat().st_size == first
+        return path.stat().st_size == first_size
     except FileNotFoundError:
         return False
 
@@ -809,7 +816,7 @@ def discover_and_upload(
         seen.add(video.name)
         uploaded += 1
         save_state(channel_dir, state)
-        time.sleep(1)
+        time.sleep(0.3)
     return uploaded
 
 
