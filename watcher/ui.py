@@ -260,8 +260,8 @@ a:hover { text-decoration: underline; }
 
 JS = """
 (function() {
-  // Live refresh: poll /api/status every 5s and update card stats in place.
-  async function refresh() {
+  // Live refresh of dashboard cards every 5s.
+  async function refreshDashboard() {
     try {
       const r = await fetch('/api/status');
       if (!r.ok) return;
@@ -274,17 +274,60 @@ JS = """
         set('[data-stat=fired]', c.fired);
         set('[data-stat=overdue]', c.overdue);
         set('[data-stat=next]', c.next_slot || '— nothing queued —');
-        const overduePill = card.querySelector('[data-stat=overdue-pill]');
-        if (overduePill) {
-          overduePill.classList.remove('ok','warn');
-          overduePill.classList.add(c.overdue === 0 ? 'ok' : 'warn');
+        const pill = card.querySelector('[data-stat=overdue-pill]');
+        if (pill) {
+          pill.classList.remove('ok','warn');
+          pill.classList.add(c.overdue === 0 ? 'ok' : 'warn');
         }
       });
     } catch(e) {}
   }
-  if (document.querySelector('[data-channel]')) {
-    setInterval(refresh, 5000);
+  if (document.querySelector('[data-channel]')) setInterval(refreshDashboard, 5000);
+
+  // Filter videos in the channel detail table by title.
+  const search = document.querySelector('[data-search-videos]');
+  if (search) {
+    search.addEventListener('input', () => {
+      const q = search.value.toLowerCase();
+      document.querySelectorAll('[data-video-row]').forEach(row => {
+        row.style.display = row.dataset.title.toLowerCase().includes(q) ? '' : 'none';
+      });
+    });
   }
+
+  // Live-update relative timestamps every 30s.
+  function fmtRel(ms) {
+    const abs = Math.abs(ms);
+    const m = Math.round(abs / 60000);
+    if (m < 1)   return ms < 0 ? 'just now' : 'in <1 min';
+    if (m < 60)  return ms < 0 ? m + 'm ago' : 'in ' + m + 'm';
+    const h = Math.round(m / 60);
+    if (h < 48)  return ms < 0 ? h + 'h ago' : 'in ' + h + 'h';
+    const d = Math.round(h / 24);
+    return ms < 0 ? d + 'd ago' : 'in ' + d + 'd';
+  }
+  function refreshRel() {
+    document.querySelectorAll('[data-when]').forEach(el => {
+      const t = parseInt(el.dataset.when, 10);
+      if (!t) return;
+      el.textContent = fmtRel(Date.now() - t);
+    });
+  }
+  refreshRel();
+  setInterval(refreshRel, 30000);
+
+  // Click-to-copy for URLs.
+  document.querySelectorAll('[data-copy]').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      try {
+        await navigator.clipboard.writeText(btn.dataset.copy);
+        const orig = btn.textContent;
+        btn.textContent = 'Copied ✓';
+        setTimeout(() => btn.textContent = orig, 1200);
+      } catch (err) {}
+    });
+  });
 })();
 """
 
@@ -300,8 +343,15 @@ BASE = """
   <div class="nav-inner">
     <a class="brand" href="{{ url_for('dashboard') }}"><span class="dot"></span>APIDistributor</a>
     <a href="{{ url_for('dashboard') }}" {% if active=='dashboard' %}class="active"{% endif %}>Channels</a>
+    {% if channels %}
+    <select onchange="if(this.value)location.href='/channel/'+this.value" style="background:var(--bg-2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:13px;">
+      <option value="">Jump to channel…</option>
+      {% for c in channels %}<option value="{{ c }}" {% if active_channel==c %}selected{% endif %}>{{ c }}</option>{% endfor %}
+    </select>
+    {% endif %}
     <a href="{{ url_for('add_channel') }}" {% if active=='add' %}class="active"{% endif %}>+ Add</a>
     <span class="nav-spacer"></span>
+    {% if flash %}<span class="pill ok"><span class="dot"></span>{{ flash }}</span>{% endif %}
     <span class="meta">{{ api }}</span>
   </div>
 </header>
@@ -313,9 +363,12 @@ BASE = """
 """
 
 
-def render(title: str, body: str, active: str = "") -> str:
+def render(title: str, body: str, active: str = "", active_channel: str = "") -> str:
     return render_template_string(
-        BASE, title=title, body=body, css=CSS, js=JS, api=api_url(), active=active,
+        BASE, title=title, body=body, css=CSS, js=JS, api=api_url(),
+        active=active, active_channel=active_channel,
+        channels=[c.name for c in channel_dirs()],
+        flash=request.args.get("flash", ""),
     )
 
 
@@ -400,27 +453,44 @@ def channel_detail(name: str):
 
     rows_html = ""
     for orig_idx, v in indexed:
-        is_fired = v.get("fired")
-        status_pill = (
-            '<span class="pill ok"><span class="dot"></span>fired</span>' if is_fired
-            else '<span class="pill warn"><span class="dot"></span>queued</span>'
-        )
+        is_published = bool(v.get("published_url"))
+        is_failed = bool(v.get("publish_failed"))
+        is_prescheduled = bool(v.get("prescheduled"))
+        is_submitted = bool(v.get("fired"))
+        if is_published:
+            status_pill = '<span class="pill ok"><span class="dot"></span>posted</span>'
+        elif is_failed:
+            status_pill = '<span class="pill err"><span class="dot"></span>failed</span>'
+        elif is_prescheduled:
+            status_pill = '<span class="pill ok"><span class="dot"></span>queued in PB</span>'
+        elif is_submitted:
+            status_pill = '<span class="pill ok"><span class="dot"></span>sent</span>'
+        else:
+            status_pill = '<span class="pill warn"><span class="dot"></span>queued</span>'
+
         try:
             slot_dt = datetime.fromisoformat(v["scheduled_for"].replace("Z", "+00:00"))
             slot_local = slot_dt.astimezone(tz)
             slot_str = slot_local.strftime("%a %b %-d · %-I:%M %p")
+            slot_rel_ms = int(slot_dt.timestamp() * 1000)
             slot_input = slot_local.strftime("%Y-%m-%dT%H:%M")
         except Exception:
             slot_str = v.get("scheduled_for", "")
+            slot_rel_ms = 0
             slot_input = ""
-        title_html = html_escape(v.get("title", v["filename"]))
+        raw_title = v.get("title", v["filename"])
+        title_html = html_escape(raw_title)
         meta_bits = []
         if v.get("published_url"):
-            meta_bits.append(f'<a href="{html_escape(v["published_url"])}" target="_blank" rel="noopener">▶ on YouTube</a>')
+            url = v["published_url"]
+            meta_bits.append(
+                f'<a href="{html_escape(url)}" target="_blank" rel="noopener" title="Open on YouTube">▶ {html_escape(url.split("v=")[-1][:11])}</a>'
+                f' <a href="#" data-copy="{html_escape(url)}" class="muted-2" style="margin-left:4px;">copy</a>'
+            )
         if v.get("publish_failed"):
-            meta_bits.append(f'<span class="pill err"><span class="dot"></span>publish failed</span>')
+            meta_bits.append(f'<span class="muted-2" title="{html_escape(str(v["publish_failed"])[:200])}">publish error</span>')
         if v.get("post_id"):
-            meta_bits.append(f'<span class="mono">post {html_escape(v["post_id"][:10])}…</span>')
+            meta_bits.append(f'<span class="mono muted-2">PB {html_escape(v["post_id"][:8])}…</span>')
         vu = v.get("variants_used") or {}
         if vu:
             tag = ", ".join(f"{k.replace('_index','')}#{vv}" for k, vv in vu.items())
@@ -429,12 +499,18 @@ def channel_detail(name: str):
         if meta_line:
             title_html += f'<div class="muted-2" style="margin-top:4px;">{meta_line}</div>'
 
-        if is_fired:
+        # Relative-time hint, JS keeps it fresh.
+        rel_html = (
+            f'<div class="muted-2" data-when="{slot_rel_ms}" style="margin-top:2px;"></div>'
+            if slot_rel_ms else ""
+        )
+
+        if is_published:
             actions = '<span class="muted-2">—</span>'
         else:
             actions = (
                 f'<form method="post" action="/channel/{name}/video/{orig_idx}/fire-now" style="display:inline;">'
-                f'<button class="subtle tiny" type="submit" title="Fire on next watcher cycle (~30s)">Fire now</button></form> '
+                f'<button class="subtle tiny" type="submit" title="Cancel any pre-schedule and fire on the next watcher cycle (~30s)">Fire now</button></form> '
                 f'<details style="display:inline-block; margin-left:6px;">'
                 f'<summary>Reschedule</summary>'
                 f'<div><form method="post" action="/channel/{name}/video/{orig_idx}/reschedule" class="row">'
@@ -442,11 +518,22 @@ def channel_detail(name: str):
                 f'<button class="subtle tiny" type="submit">Save</button></form></div>'
                 f'</details> '
                 f'<form method="post" action="/channel/{name}/video/{orig_idx}/delete" '
-                f'onsubmit="return confirm(\'Remove from queue? File in posted/ stays on disk.\');" style="display:inline;">'
+                f'onsubmit="return confirm(\'Remove from queue? File in posted/ stays on disk; Post Bridge schedule is cancelled.\');" style="display:inline;">'
                 f'<button class="danger tiny" type="submit">Delete</button></form>'
             )
-        rows_html += f"<tr><td>{title_html}</td><td>{slot_str}</td><td>{status_pill}</td><td>{actions}</td></tr>"
+        rows_html += (
+            f'<tr data-video-row data-title="{html_escape(raw_title)}">'
+            f'<td>{title_html}</td>'
+            f'<td>{slot_str}{rel_html}</td>'
+            f'<td>{status_pill}</td>'
+            f'<td>{actions}</td>'
+            '</tr>'
+        )
 
+    search_html = (
+        '<input data-search-videos type="text" placeholder="Filter by title…" '
+        'style="max-width:280px; margin-bottom:0;">'
+    )
     table_html = (
         f'<table><thead><tr><th>Video</th><th>Slot</th><th>Status</th><th></th></tr></thead><tbody>{rows_html}</tbody></table>'
         if rows_html else
@@ -488,17 +575,32 @@ def channel_detail(name: str):
       </div>
     </div>
 
+    <h2 style="margin-top:28px;">Quick actions</h2>
+    <div class="card">
+      <form method="post" action="/channel/{name}/bonus-today" class="row" style="align-items:flex-end; gap:14px;">
+        <div style="flex:1; min-width:280px;">
+          <label style="display:block; font-size:12px; color:var(--text-2); margin-bottom:6px; font-weight:500;">Add bonus posts today</label>
+          <input name="times" type="text" placeholder="21:00, 22:30, 23:45" required>
+          <div class="muted-2" style="margin-top:4px;">Comma-separated times today (24-hour). Pulls the next queued videos forward to those times.</div>
+        </div>
+        <button type="submit" title="Pull queued videos forward to extra slots today">Pull videos to today</button>
+      </form>
+      <div class="divider"></div>
+      <form method="post" action="/channel/{name}/reschedule-all"
+            onsubmit="return confirm('Repack ALL queued videos onto the current schedule, starting from now? Useful after editing times/days in config. Already-published videos stay put.');"
+            style="display:inline;">
+        <button class="subtle" type="submit"
+                title="Re-distribute every queued video evenly across the current schedule, starting from now. Use after editing the times-per-day or days settings.">↻ Reschedule all queued</button>
+      </form>
+    </div>
+
     <div class="row spread" style="margin-top:28px; align-items:baseline;">
       <h2 style="margin:0;">Videos ({len(indexed)})</h2>
       <div class="row">
+        {search_html}
         <a class="btn tiny ghost{(' active' if filt=='all' else '')}" href="?filter=all">All</a>
         <a class="btn tiny ghost{(' active' if filt=='queued' else '')}" href="?filter=queued">Queued</a>
         <a class="btn tiny ghost{(' active' if filt=='fired' else '')}" href="?filter=fired">Fired</a>
-        <form method="post" action="/channel/{name}/reschedule-all"
-              onsubmit="return confirm('Repack ALL queued videos onto the current schedule, starting from now? This applies your latest times/days settings to videos that were scheduled with old settings. Fired videos are untouched.');"
-              style="display:inline; margin-left:8px;">
-          <button class="subtle tiny" type="submit" title="Apply current schedule to all queued videos">↻ Reschedule all</button>
-        </form>
       </div>
     </div>
     {table_html}
@@ -515,7 +617,7 @@ def channel_detail(name: str):
       </div>
     </form>
     """
-    return render(name, body)
+    return render(name, body, active_channel=name)
 
 
 @app.route("/channel/<name>/config", methods=["POST"])
@@ -622,7 +724,7 @@ def variants_page(name: str):
       </div>
     </div>
     """
-    return render(f"{name} — Variants", body)
+    return render(f"{name} — Variants", body, active_channel=name)
 
 
 @app.route("/channel/<name>/variants/import", methods=["POST"])
@@ -673,21 +775,26 @@ def reschedule_video(name: str, idx: int):
     when = request.form.get("when", "").strip()
     if not when or idx >= len(state.get("videos", [])):
         abort(400)
+    s = watcher_lib.load_settings()
+    watcher_lib.unschedule_video(s, state["videos"][idx])
     state["videos"][idx]["scheduled_for"] = when
     write_state(channel_dir, state)
-    return redirect(url_for("channel_detail", name=name))
+    return redirect(url_for("channel_detail", name=name, flash="Rescheduled"))
 
 
 @app.route("/channel/<name>/video/<int:idx>/delete", methods=["POST"])
 def delete_video(name: str, idx: int):
-    """Remove an unfired video from the queue. The source file in posted/ stays."""
+    """Remove a video from the queue. Cancels Post Bridge pre-scheduled post
+    if any. The source file in posted/ stays on disk."""
     if not safe_name(name):
         abort(400)
     channel_dir, _, state = load_channel(name)
     if idx < len(state.get("videos", [])):
+        s = watcher_lib.load_settings()
+        watcher_lib.unschedule_video(s, state["videos"][idx])
         state["videos"].pop(idx)
         write_state(channel_dir, state)
-    return redirect(url_for("channel_detail", name=name))
+    return redirect(url_for("channel_detail", name=name, flash="Removed from queue"))
 
 
 @app.route("/channel/<name>/video/<int:idx>/fire-now", methods=["POST"])
@@ -697,9 +804,11 @@ def fire_now(name: str, idx: int):
     channel_dir, _, state = load_channel(name)
     if idx >= len(state.get("videos", [])):
         abort(400)
+    s = watcher_lib.load_settings()
+    watcher_lib.unschedule_video(s, state["videos"][idx])
     state["videos"][idx]["scheduled_for"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     write_state(channel_dir, state)
-    return redirect(url_for("channel_detail", name=name))
+    return redirect(url_for("channel_detail", name=name, flash="Will fire on next watcher cycle"))
 
 
 @app.route("/channel/<name>/calendar")
@@ -786,20 +895,43 @@ def channel_calendar(name: str):
     <p class="subhead">Times shown in <strong>{sched.get('timezone','UTC')}</strong>. <strong>Queued in PB</strong> = already pre-scheduled in Post Bridge — fires from their cloud even if your Mac is off.</p>
     <div class="cal-grid">{days_html}</div>
     """
-    return render(f"{name} — Calendar", body)
+    return render(f"{name} — Calendar", body, active_channel=name)
 
 
 @app.route("/channel/<name>/reschedule-all", methods=["POST"])
 def reschedule_all(name: str):
-    """Repack every unfired video onto the current config's schedule, starting
-    from now. Use this after editing the schedule (times/days)."""
+    """Repack every queued/pre-scheduled video onto the current config's schedule,
+    starting from now. Cancels Post Bridge pre-scheduled posts so the watcher
+    re-submits them at the new times."""
     if not safe_name(name):
         abort(400)
     channel_dir, config, state = load_channel(name)
-    n = watcher_lib.reschedule_all_queued(state, config)
+    s = watcher_lib.load_settings()
+    n = watcher_lib.reschedule_all_queued(state, config, s=s)
     if n:
         write_state(channel_dir, state)
-    return redirect(url_for("channel_detail", name=name))
+    return redirect(url_for("channel_detail", name=name, flash=f"Rescheduled {n} videos"))
+
+
+@app.route("/channel/<name>/bonus-today", methods=["POST"])
+def bonus_today(name: str):
+    """Pull the earliest queued videos forward to extra slots today.
+    Form fields: `times` (comma-separated HH:MM)."""
+    if not safe_name(name):
+        abort(400)
+    channel_dir, config, state = load_channel(name)
+    raw = request.form.get("times", "")
+    times = [t.strip() for t in raw.replace("\n", ",").split(",") if t.strip()]
+    if not times:
+        return redirect(url_for("channel_detail", name=name, flash="No times provided"))
+    s = watcher_lib.load_settings()
+    n = watcher_lib.add_bonus_slots_today(state, config, times, s=s)
+    if n:
+        write_state(channel_dir, state)
+    return redirect(url_for(
+        "channel_detail", name=name,
+        flash=f"Pulled {n} video{'s' if n != 1 else ''} to today" if n else "No videos to pull forward",
+    ))
 
 
 # -------------------- add channel --------------------

@@ -299,7 +299,34 @@ def first_slot_for_new_video(config: dict, state: dict) -> datetime:
     return next_free_slot(config, after=now, used=used)
 
 
-def reschedule_all_queued(state: dict, config: dict) -> int:
+def cancel_postbridge_post(s: Settings, post_id: str) -> bool:
+    """Best-effort DELETE of a scheduled post in Post Bridge.
+    Returns True if the post is gone (deleted or already 404), False otherwise."""
+    try:
+        r = requests.delete(
+            f"{s.api_url}/posts/{post_id}",
+            headers=auth_headers(s),
+            timeout=15,
+        )
+        return r.ok or r.status_code == 404
+    except requests.RequestException as e:
+        log.warning("Could not cancel Post Bridge post %s: %s", post_id, e)
+        return False
+
+
+def unschedule_video(s: Settings | None, video: dict) -> None:
+    """Reset a video's submission state so it can be re-submitted at a new
+    time. Cancels any existing Post Bridge post first if we have an `s`."""
+    post_id = video.get("post_id")
+    if post_id and s is not None:
+        cancel_postbridge_post(s, post_id)
+    video["fired"] = False
+    video["prescheduled"] = False
+    for k in ("post_id", "fired_at"):
+        video.pop(k, None)
+
+
+def reschedule_all_queued(state: dict, config: dict, s: Settings | None = None) -> int:
     """Repack every unfired video onto the current schedule, starting from now.
     Preserves the original order (by previous scheduled_for). Used when the
     user changes times-per-day or days-of-week and wants the existing queue
@@ -314,19 +341,92 @@ def reschedule_all_queued(state: dict, config: dict) -> int:
             except (KeyError, ValueError):
                 pass
 
-    unfired = [v for v in state["videos"] if not v.get("fired")]
-    unfired.sort(key=lambda v: v.get("scheduled_for", ""))
+    # Treat any video whose state shows it's been submitted to Post Bridge
+    # but isn't yet published as eligible to be rescheduled. (Truly published
+    # ones have published_url and we leave them alone.)
+    queued_or_prescheduled = [
+        v for v in state["videos"]
+        if not v.get("published_url")
+    ]
+    queued_or_prescheduled.sort(key=lambda v: v.get("scheduled_for", ""))
 
     used = set(fired_slots)
     rebalanced = 0
-    for v in unfired:
+    for v in queued_or_prescheduled:
         new_slot = next_free_slot(config, after=now, used=used)
         new_iso = new_slot.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
         if v.get("scheduled_for") != new_iso:
+            unschedule_video(s, v)
             v["scheduled_for"] = new_iso
             rebalanced += 1
         used.add(new_slot)
     return rebalanced
+
+
+def add_bonus_slots_today(
+    state: dict, config: dict, times: list[str], s: Settings | None = None,
+) -> int:
+    """Take the earliest queued (un-published) videos and reschedule them onto
+    extra slots today at the given times. Used for "post more today" cases.
+    Cancels Post Bridge pre-scheduled posts so the watcher re-submits cleanly."""
+    tz = get_schedule_tz(config)
+    today = datetime.now(tz).date()
+    now = datetime.now(tz)
+
+    new_slots: list[datetime] = []
+    for t in times:
+        try:
+            hh, mm = parse_time_of_day(t)
+        except (ValueError, AttributeError):
+            continue
+        slot = datetime(today.year, today.month, today.day, hh, mm, tzinfo=tz)
+        if slot <= now + timedelta(minutes=2):
+            continue  # only future slots today
+        new_slots.append(slot)
+    new_slots.sort()
+    if not new_slots:
+        return 0
+
+    used = set()
+    for v in state["videos"]:
+        if v.get("published_url"):
+            continue
+        try:
+            used.add(parse_iso(v["scheduled_for"], tz))
+        except (KeyError, ValueError):
+            pass
+
+    queued = [v for v in state["videos"] if not v.get("published_url")]
+    queued.sort(key=lambda v: v.get("scheduled_for", ""))
+
+    moved = 0
+    for slot in new_slots:
+        if slot.replace(microsecond=0) in {u.replace(microsecond=0) for u in used}:
+            continue  # already filled
+        # Find the next queued video that's NOT already at-or-before this slot
+        target = None
+        for v in queued:
+            if v.get("_bonus_assigned"):
+                continue
+            try:
+                v_slot = parse_iso(v["scheduled_for"], tz)
+            except (KeyError, ValueError):
+                continue
+            if v_slot <= slot:
+                continue  # already firing earlier today, no need to move
+            target = v
+            break
+        if target is None:
+            break
+        target["_bonus_assigned"] = True
+        unschedule_video(s, target)
+        target["scheduled_for"] = slot.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        used.add(slot)
+        moved += 1
+
+    for v in state["videos"]:
+        v.pop("_bonus_assigned", None)
+    return moved
 
 
 # -------------------- Title / sidecar helpers --------------------
