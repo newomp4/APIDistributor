@@ -1,38 +1,39 @@
-# Copy this folder to give a new channel its own folder, e.g. channels/pet_facts/
-# Each setting below is documented inline.
+# Copy this folder to channels/<your-channel>/ and edit below.
 
-# The exact display name of the channel as it appears in Postiz (case-insensitive).
-# Look at your Postiz dashboard → connected channels list to see the name.
-integration_name: "MyYouTubeChannelName"
+# Post Bridge channel name (the "username" field from /v1/social-accounts).
+# Case-insensitive match. You can also use the numeric account id.
+social_account: "MyChannelName"
 
-# When videos in inbox/ should be scheduled to upload.
+# Where to look for new videos. Empty/missing = use this folder's inbox/.
+source_folder: ""
+
+# After scheduling, move files to this channel's posted/ folder.
+# Set false if you want originals untouched (advanced).
+move_after_post: true
+
+# How late can a slot fire before we push it to the next free slot?
+catch_up_window_minutes: 30
+
 schedule:
-  # Local times (24-hour). Each entry is a daily slot.
+  # Daily slot times in the channel timezone (24-hour).
   times: ["09:00", "18:00"]
 
-  # Days of week to post on.
+  # Days the schedule runs on.
   days: [Mon, Tue, Wed, Thu, Fri, Sat, Sun]
 
-  # IANA timezone (e.g. America/New_York, Europe/London, Asia/Tokyo).
+  # IANA timezone (America/New_York, Europe/London, Asia/Tokyo, ...)
   timezone: "America/New_York"
 
-# YouTube-specific settings applied to every upload from this folder.
 youtube:
-  # The YouTube title. {filename} is replaced with the video filename (no extension).
-  # Must end up between 2 and 100 characters.
-  title_template: "{filename}"
+  # {smart_title} = filename with dashes turned into a Title Case sentence
+  # (the video ID suffix from yt-dlp output gets stripped automatically).
+  # Per-video sidecar JSON files override this. Title must be 2-100 chars.
+  title_template: "{smart_title}"
 
-  # Description shown beneath the video.
+  # If set, prepended to every description — first line of YouTube descriptions
+  # is visible above the fold, so this acts like a pinned comment.
+  pinned_message: ""
+
+  # The rest of the description.
   description: |
     Subscribe for more!
-
-  # public | unlisted | private
-  privacy: "public"
-
-  # "yes" or "no" — whether the video is made-for-kids (COPPA).
-  made_for_kids: "no"
-
-  # Tags applied to every upload (list of strings).
-  tags:
-    - shorts
-    - tutorial

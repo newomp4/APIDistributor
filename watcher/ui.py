@@ -35,22 +35,24 @@ app = Flask(__name__)
 
 
 def api_url() -> str:
-    return os.environ.get("POSTIZ_API_URL", "http://localhost:4007/api/public/v1").rstrip("/")
+    return os.environ.get("POSTBRIDGE_API_URL", "https://api.post-bridge.com/v1").rstrip("/")
 
 
 def api_key() -> str:
-    return os.environ.get("POSTIZ_API_KEY", "")
+    return os.environ.get("POSTBRIDGE_API_KEY", "")
 
 
 def fetch_integrations() -> list[dict]:
+    """Returns list of {id, platform, username} for Post Bridge accounts."""
     try:
         r = requests.get(
-            f"{api_url()}/integrations",
-            headers={"Authorization": api_key()},
+            f"{api_url()}/social-accounts",
+            headers={"Authorization": f"Bearer {api_key()}"},
             timeout=5,
         )
         r.raise_for_status()
-        return r.json()
+        payload = r.json()
+        return payload.get("data", payload) if isinstance(payload, dict) else payload
     except Exception:
         return []
 
@@ -213,13 +215,8 @@ def dashboard():
         cards_html = '<div class="card muted">No channels configured yet. Click <a href="/add">+ Add Channel</a> to start.</div>'
 
     body = f'''
-    <h1>Channels <span class="muted" style="font-size:14px;">({integ_count} integrations connected in Postiz)</span></h1>
+    <h1>Channels <span class="muted" style="font-size:14px;">({integ_count} accounts connected in Post Bridge)</span></h1>
     <div class="grid">{cards_html}</div>
-    <h2 style="margin-top:32px;">Quick actions</h2>
-    <form method="post" action="/restart-docker" style="display:inline;">
-      <button class="subtle" type="submit" onclick="return confirm('Restart all Docker containers? Postiz will be unreachable for ~30 seconds.');">↻ Restart Docker stack</button>
-    </form>
-    <a class="button subtle" href="/logs" style="margin-left:8px;">View recent logs</a>
     '''
     return render("Dashboard", body)
 
@@ -236,25 +233,43 @@ def channel_detail(name: str):
     sched = config.get("schedule", {})
     yt = config.get("youtube", {})
 
-    videos = list(state.get("videos", []))
-    videos.sort(key=lambda v: v.get("scheduled_for", ""))
+    # Pair each video with its original index in state.videos so action endpoints
+    # (which take the index) work after sorting for display.
+    indexed = list(enumerate(state.get("videos", [])))
+    indexed.sort(key=lambda iv: iv[1].get("scheduled_for", ""))
 
     rows_html = ""
-    for v in videos:
+    for orig_idx, v in indexed:
         status_pill = '<span class="pill ok">fired</span>' if v.get("fired") else '<span class="pill warn">queued</span>'
         try:
             slot_dt = datetime.fromisoformat(v["scheduled_for"].replace("Z", "+00:00"))
             slot_str = slot_dt.astimezone(ZoneInfo(sched.get("timezone", "UTC"))).strftime("%a %b %d %I:%M %p")
+            slot_input = slot_dt.astimezone(ZoneInfo(sched.get("timezone", "UTC"))).strftime("%Y-%m-%dT%H:%M")
         except Exception:
             slot_str = v.get("scheduled_for", "")
+            slot_input = ""
         title_html = v.get("title", v["filename"])
         if v.get("post_id"):
             title_html += f'<br><span class="muted">post {v["post_id"]}</span>'
-        rows_html += f'<tr><td>{title_html}</td><td>{slot_str}</td><td>{status_pill}</td></tr>'
+        if v.get("fired"):
+            actions = '<span class="muted">—</span>'
+        else:
+            actions = (
+                f'<form method="post" action="/channel/{name}/video/{orig_idx}/fire-now" style="display:inline;">'
+                f'<button class="subtle" type="submit" title="Fire on next watcher cycle (~30s)">Fire now</button></form> '
+                f'<details style="display:inline-block;"><summary style="cursor:pointer;color:#6cc1ff;">Reschedule</summary>'
+                f'<form method="post" action="/channel/{name}/video/{orig_idx}/reschedule" style="margin-top:6px;">'
+                f'<input name="when" type="datetime-local" value="{slot_input}" required>'
+                f'<button class="subtle" type="submit">Save</button></form></details> '
+                f'<form method="post" action="/channel/{name}/video/{orig_idx}/delete" '
+                f'onsubmit="return confirm(\'Remove this video from the queue? File in posted/ stays on disk.\');" style="display:inline;">'
+                f'<button class="danger" type="submit">Delete</button></form>'
+            )
+        rows_html += f'<tr><td>{title_html}</td><td>{slot_str}</td><td>{status_pill}</td><td>{actions}</td></tr>'
 
     body = f'''
     <h1>{name}</h1>
-    <div class="muted">Postiz channel: <strong>{config.get('integration_name','?')}</strong></div>
+    <div class="muted">Post Bridge account: <strong>{config.get('social_account', config.get('integration_name','?'))}</strong></div>
     <div class="muted">Source: <code>{config.get('source_folder') or '(channel inbox/)'}</code></div>
     <div style="margin: 16px 0;">
       <span class="stat"><strong>{stats['queued']}</strong> queued</span>
@@ -268,13 +283,12 @@ def channel_detail(name: str):
       <div class="muted">Times: <strong>{', '.join(sched.get('times', [])) or '(none)'}</strong></div>
       <div class="muted">Days: <strong>{' '.join(sched.get('days', [])) or '(all)'}</strong></div>
       <div class="muted">Timezone: <strong>{sched.get('timezone','UTC')}</strong></div>
-      <div class="muted">Privacy: <strong>{yt.get('privacy','public')}</strong></div>
     </div>
 
-    <h2 style="margin-top:24px;">Videos ({len(videos)})</h2>
+    <h2 style="margin-top:24px;">Videos ({len(indexed)})</h2>
     <table>
-      <tr><th>Title</th><th>Slot</th><th>Status</th></tr>
-      {rows_html or '<tr><td colspan="3" class="muted">No videos yet — drop one in the source folder.</td></tr>'}
+      <tr><th>Title</th><th>Slot</th><th>Status</th><th>Actions</th></tr>
+      {rows_html or '<tr><td colspan="4" class="muted">No videos yet — drop one in the source folder.</td></tr>'}
     </table>
 
     <h2 style="margin-top:24px;">Edit config</h2>
@@ -326,11 +340,11 @@ def delete_channel(name: str):
 def add_channel():
     integrations = fetch_integrations()
     options_html = "".join(
-        f'<option value="{i["name"]}">{i["name"]} ({i["identifier"]})</option>'
+        f'<option value="{i["username"]}">{i["username"]} ({i["platform"]})</option>'
         for i in integrations
     )
     if not options_html:
-        options_html = '<option value="">⚠️ No integrations found — connect a channel in Postiz first</option>'
+        options_html = '<option value="">⚠️ No accounts found — connect a channel in Post Bridge first</option>'
 
     body = f'''
     <h1>Add a new channel</h1>
@@ -340,8 +354,8 @@ def add_channel():
         <input name="name" type="text" placeholder="my_new_channel" required pattern="[a-z0-9_]{{1,40}}">
       </div>
       <div class="field">
-        <label>Postiz integration (the channel as connected in Postiz)</label>
-        <select name="integration_name" required>{options_html}</select>
+        <label>Post Bridge account (the channel as connected in Post Bridge)</label>
+        <select name="social_account" required>{options_html}</select>
       </div>
       <div class="field">
         <label>Source folder (absolute path; videos will be picked up from here)</label>
@@ -396,9 +410,10 @@ def add_channel_post():
     tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
 
     config = {
-        "integration_name": request.form.get("integration_name", "").strip(),
+        "social_account": request.form.get("social_account", "").strip(),
         "source_folder": request.form.get("source_folder", "").strip() or None,
         "move_after_post": True,
+        "catch_up_window_minutes": 30,
         "schedule": {
             "times": times,
             "days": days,
@@ -406,10 +421,8 @@ def add_channel_post():
         },
         "youtube": {
             "title_template": request.form.get("title_template", "{smart_title}").strip(),
+            "pinned_message": "",
             "description": request.form.get("description", "").strip() or "Subscribe for more!",
-            "privacy": request.form.get("privacy", "public"),
-            "made_for_kids": "no",
-            "tags": tags,
         },
     }
     if not config["source_folder"]:
@@ -423,27 +436,45 @@ def add_channel_post():
     return redirect(url_for("channel_detail", name=name))
 
 
-# -------------------- docker actions --------------------
+# -------------------- per-video actions --------------------
 
 
-@app.route("/restart-docker", methods=["POST"])
-def restart_docker():
-    cmd = ["docker", "compose", "--project-directory", str(PROJECT_ROOT), "restart"]
-    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return redirect(url_for("dashboard"))
+@app.route("/channel/<name>/video/<int:idx>/reschedule", methods=["POST"])
+def reschedule_video(name: str, idx: int):
+    if not safe_name(name):
+        abort(400)
+    channel_dir, _, state = load_channel(name)
+    when = request.form.get("when", "").strip()
+    if not when or idx >= len(state.get("videos", [])):
+        abort(400)
+    state["videos"][idx]["scheduled_for"] = when
+    (channel_dir / "_state.json").write_text(json.dumps(state, indent=2))
+    return redirect(url_for("channel_detail", name=name))
 
 
-# -------------------- logs --------------------
+@app.route("/channel/<name>/video/<int:idx>/delete", methods=["POST"])
+def delete_video(name: str, idx: int):
+    """Remove an unfired video from the queue. Doesn't delete the source file."""
+    if not safe_name(name):
+        abort(400)
+    channel_dir, _, state = load_channel(name)
+    if idx < len(state.get("videos", [])):
+        state["videos"].pop(idx)
+        (channel_dir / "_state.json").write_text(json.dumps(state, indent=2))
+    return redirect(url_for("channel_detail", name=name))
 
 
-@app.route("/logs")
-def logs():
-    log_path = Path("/tmp/apidistributor-watcher.log")
-    text = "(no log file yet — watcher writes to stdout, not to a file)"
-    if log_path.exists():
-        text = log_path.read_text()[-8000:]
-    body = f'<h1>Recent watcher activity</h1><pre>{text}</pre><div class="muted">For full live logs, watch the Terminal window where you ran <code>start-watcher.command</code>.</div>'
-    return render("Logs", body)
+@app.route("/channel/<name>/video/<int:idx>/fire-now", methods=["POST"])
+def fire_now(name: str, idx: int):
+    """Bump a queued video to fire on the watcher's next polling cycle."""
+    if not safe_name(name):
+        abort(400)
+    channel_dir, _, state = load_channel(name)
+    if idx >= len(state.get("videos", [])):
+        abort(400)
+    state["videos"][idx]["scheduled_for"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    (channel_dir / "_state.json").write_text(json.dumps(state, indent=2))
+    return redirect(url_for("channel_detail", name=name))
 
 
 # -------------------- API --------------------

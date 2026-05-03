@@ -1,29 +1,30 @@
 #!/usr/bin/env python3
 """
-APIDistributor folder-watcher v2 — burst-proof scheduler.
+APIDistributor folder-watcher (Post Bridge edition).
 
-This watcher is the SCHEDULER. Postiz is just the publisher.
+The watcher is the SCHEDULER. Post Bridge is the publisher.
 
 Lifecycle for each video:
   1. Discover  — file appears in source_folder
-  2. Upload    — file gets uploaded to Postiz /upload (returns media id+path)
-                 watcher records intended slot in _state.json (fired=False)
+  2. Upload    — get pre-signed URL from Post Bridge, PUT the file to S3
+                 record media_id + intended slot in _state.json (fired=False)
                  file is moved to posted/
   3. Fire      — when slot time arrives (within CATCH_UP_WINDOW of now),
-                 watcher posts type=now to Postiz, which uploads to YouTube.
-                 watcher marks fired=True.
+                 watcher posts type=now to Post Bridge, which uploads to
+                 YouTube. Marks fired=True.
   4. Rebalance — if a slot has been due for more than CATCH_UP_WINDOW and
-                 hasn't fired (Mac/Docker was off), push that video's
-                 scheduled_for to the next free future slot. Prevents burst.
+                 hasn't fired, push that video's scheduled_for to the next
+                 free future slot. Prevents burst.
 
 Per-channel config.yaml:
-  integration_name:   Postiz channel name (case-insensitive match).
-  source_folder:      Optional absolute path (default: ./inbox/).
-  move_after_post:    Bool, default true — move file to posted/ after upload.
-  catch_up_window_minutes: Int, default 30 — tolerance for late firing.
-  schedule:           times (HH:MM list), days (Mon..Sun), timezone (IANA).
-  youtube:            title_template, description, privacy, made_for_kids, tags.
-  force_first_slot:   Optional ISO datetime — first NEW video uses this slot.
+  social_account: Post Bridge channel name (case-insensitive match to
+                  social-accounts username) OR numeric account id.
+  source_folder:  Optional absolute path (default: ./inbox/).
+  move_after_post: Bool, default true.
+  catch_up_window_minutes: Int, default 30.
+  schedule:       times (HH:MM list), days (Mon..Sun), timezone (IANA).
+  youtube:        title_template, description, pinned_message
+  force_first_slot: Optional ISO datetime.
 """
 
 import json
@@ -45,6 +46,7 @@ from dotenv import load_dotenv
 import ui as ui_module
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"}
+VIDEO_MIME = {".mp4": "video/mp4", ".mov": "video/quicktime", ".m4v": "video/mp4"}
 POLL_SECONDS = 30
 DEFAULT_CATCH_UP_MINUTES = 30
 DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -67,15 +69,15 @@ class Settings:
 def load_settings() -> Settings:
     project_root = Path(__file__).resolve().parent.parent
     load_dotenv(project_root / ".env")
-    api_key = os.environ.get("POSTIZ_API_KEY", "").strip()
+    api_key = os.environ.get("POSTBRIDGE_API_KEY", "").strip()
     if not api_key:
         log.error(
-            "POSTIZ_API_KEY missing from .env. "
-            "Generate one in Postiz: Settings > Developers > Public API."
+            "POSTBRIDGE_API_KEY missing from .env. "
+            "Generate one at https://www.post-bridge.com/dashboard/api-keys"
         )
         sys.exit(1)
     api_url = os.environ.get(
-        "POSTIZ_API_URL", "http://localhost:4007/api/public/v1"
+        "POSTBRIDGE_API_URL", "https://api.post-bridge.com/v1"
     ).rstrip("/")
     return Settings(
         api_url=api_url,
@@ -84,84 +86,88 @@ def load_settings() -> Settings:
     )
 
 
-# -------------------- Postiz API client --------------------
+# -------------------- Post Bridge API client --------------------
 
 
-def fetch_integrations(s: Settings) -> dict[str, dict]:
+def auth_headers(s: Settings) -> dict[str, str]:
+    return {"Authorization": f"Bearer {s.api_key}"}
+
+
+def fetch_social_accounts(s: Settings) -> dict[str, dict]:
+    """Returns {username_lower: {id, platform, username}} for connected accounts."""
     r = requests.get(
-        f"{s.api_url}/integrations",
-        headers={"Authorization": s.api_key},
+        f"{s.api_url}/social-accounts",
+        headers=auth_headers(s),
         timeout=15,
     )
     r.raise_for_status()
-    return {integ["name"].lower(): integ for integ in r.json()}
+    payload = r.json()
+    items = payload.get("data", payload) if isinstance(payload, dict) else payload
+    return {item["username"].lower(): item for item in items}
 
 
 def upload_media(s: Settings, file_path: Path) -> dict:
-    """Upload file to Postiz, return {id, path}. Path is rewritten to
-    host.docker.internal so the in-container YouTube worker can fetch it."""
+    """Two-step upload:
+      1. POST /v1/media/create-upload-url with metadata -> get media_id + signed URL.
+      2. PUT the file to the signed URL.
+    Returns {"id": media_id, "name": filename}.
+    """
+    size = file_path.stat().st_size
+    mime = VIDEO_MIME.get(file_path.suffix.lower(), "video/mp4")
+
+    r = requests.post(
+        f"{s.api_url}/media/create-upload-url",
+        headers={**auth_headers(s), "Content-Type": "application/json"},
+        json={"mime_type": mime, "size_bytes": size, "name": file_path.name},
+        timeout=30,
+    )
+    r.raise_for_status()
+    info = r.json()
+    media_id = info["media_id"]
+    upload_url = info["upload_url"]
+
     with file_path.open("rb") as fh:
-        r = requests.post(
-            f"{s.api_url}/upload",
-            headers={"Authorization": s.api_key},
-            files={"file": (file_path.name, fh, "video/mp4")},
+        put = requests.put(
+            upload_url,
+            data=fh,
+            headers={"Content-Type": mime},
             timeout=600,
         )
-    r.raise_for_status()
-    media = r.json()
-    if isinstance(media.get("path"), str):
-        media["path"] = media["path"].replace(
-            "://localhost:4007/", "://host.docker.internal:4007/"
+    if not put.ok:
+        log.error(
+            "S3 upload PUT failed: %s %s", put.status_code, put.text[:500]
         )
-    return media
+        put.raise_for_status()
+
+    return {"id": media_id, "name": file_path.name}
 
 
 def post_now(
     s: Settings,
-    integration_id: str,
-    media: dict,
-    config: dict,
+    social_account_id: int,
+    media_id: str,
+    caption: str,
     title: str,
-    description: str,
-    tags: list[str],
 ) -> dict:
-    """Fire a type=now post to Postiz, which immediately uploads to YouTube."""
-    yt = config.get("youtube", {})
+    """Fire a type=now post to Post Bridge."""
     payload = {
-        "type": "now",
-        "date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-        "shortLink": False,
-        "tags": [],
-        "posts": [
-            {
-                "integration": {"id": integration_id},
-                "value": [
-                    {
-                        "content": description,
-                        "image": [{"id": media["id"], "path": media["path"]}],
-                    }
-                ],
-                "settings": {
-                    "__type": "youtube",
-                    "title": title,
-                    "type": yt.get("privacy", "public"),
-                    "selfDeclaredMadeForKids": yt.get("made_for_kids", "no"),
-                    "tags": [{"value": t, "label": t} for t in tags],
-                },
-            }
-        ],
+        "caption": caption,
+        "social_accounts": [int(social_account_id)],
+        "media": [media_id],
+        "platform_configurations": {
+            "youtube": {"title": title},
+        },
     }
     r = requests.post(
         f"{s.api_url}/posts",
-        headers={
-            "Authorization": s.api_key,
-            "Content-Type": "application/json",
-        },
+        headers={**auth_headers(s), "Content-Type": "application/json"},
         data=json.dumps(payload),
         timeout=60,
     )
     if not r.ok:
-        log.error("Postiz rejected /posts: %s %s", r.status_code, r.text[:500])
+        log.error(
+            "Post Bridge rejected /posts: %s %s", r.status_code, r.text[:500]
+        )
         r.raise_for_status()
     return r.json()
 
@@ -178,9 +184,8 @@ def load_state(channel_dir: Path) -> dict:
     except json.JSONDecodeError:
         log.warning("State file corrupt at %s — starting fresh", state_file)
         return {"videos": []}
-    # Migrate old shape ({"scheduled": [...]}) — discard, start fresh
     if "videos" not in data:
-        log.info("Migrating old state file at %s — starting fresh schedule", state_file)
+        log.info("State file at %s in old format — starting fresh", state_file)
         return {"videos": []}
     return data
 
@@ -198,51 +203,44 @@ def parse_time_of_day(s: str) -> tuple[int, int]:
 
 
 def get_schedule_tz(config: dict) -> ZoneInfo:
-    tz_name = config.get("schedule", {}).get("timezone", "UTC")
-    return ZoneInfo(tz_name)
+    return ZoneInfo(config.get("schedule", {}).get("timezone", "UTC"))
 
 
 def parse_iso(s: str, default_tz: ZoneInfo) -> datetime:
-    dt = datetime.fromisoformat(s)
+    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=default_tz)
     return dt
 
 
 def next_free_slot(
-    config: dict,
-    after: datetime,
-    used_slots: set[datetime],
+    config: dict, after: datetime, used: set[datetime],
 ) -> datetime:
-    """First slot that is strictly after `after`, on a configured day/time,
-    and not already in `used_slots`."""
     sched = config.get("schedule", {})
     times = sched.get("times", ["12:00"])
     days = set(sched.get("days", DAY_NAMES))
     tz = get_schedule_tz(config)
     after_local = after.astimezone(tz)
-    used_local = {dt.astimezone(tz).replace(microsecond=0) for dt in used_slots}
+    used_local = {dt.astimezone(tz).replace(microsecond=0) for dt in used}
     for offset in range(0, 365):
-        candidate_day = after_local.date() + timedelta(days=offset)
-        weekday_short = DAY_NAMES[candidate_day.weekday()]
-        if weekday_short not in days:
+        candidate = after_local.date() + timedelta(days=offset)
+        if DAY_NAMES[candidate.weekday()] not in days:
             continue
         for tstr in times:
             hh, mm = parse_time_of_day(tstr)
             slot = datetime(
-                candidate_day.year, candidate_day.month, candidate_day.day,
-                hh, mm, 0, tzinfo=tz,
+                candidate.year, candidate.month, candidate.day,
+                hh, mm, tzinfo=tz,
             )
             if slot <= after_local:
                 continue
             if slot.replace(microsecond=0) in used_local:
                 continue
             return slot
-    raise RuntimeError("Could not find a free slot in the next 365 days.")
+    raise RuntimeError("No free slot in 365 days.")
 
 
 def collect_used_slots(state: dict, default_tz: ZoneInfo) -> set[datetime]:
-    """All scheduled_for times (fired or not) — used to avoid double-booking."""
     used = set()
     for v in state["videos"]:
         try:
@@ -252,16 +250,10 @@ def collect_used_slots(state: dict, default_tz: ZoneInfo) -> set[datetime]:
     return used
 
 
-def first_slot_for_new_video(
-    config: dict,
-    state: dict,
-) -> datetime:
-    """Slot for the next video being added. Honors force_first_slot if no
-    videos have been added to state yet AND the time is in the future."""
+def first_slot_for_new_video(config: dict, state: dict) -> datetime:
     tz = get_schedule_tz(config)
     now = datetime.now(tz)
     used = collect_used_slots(state, tz)
-
     if not state["videos"]:
         force_first = config.get("force_first_slot")
         if force_first:
@@ -269,14 +261,13 @@ def first_slot_for_new_video(
                 forced = parse_iso(str(force_first), tz)
                 if forced > now:
                     return forced
-                log.info("force_first_slot %s already passed, using regular schedule", forced)
+                log.info("force_first_slot %s passed, using regular schedule", forced)
             except ValueError:
                 log.warning("force_first_slot %r invalid, ignoring", force_first)
+    return next_free_slot(config, after=now, used=used)
 
-    return next_free_slot(config, after=now, used_slots=used)
 
-
-# -------------------- Filename / sidecar helpers --------------------
+# -------------------- Title / sidecar helpers --------------------
 
 
 def extract_smart_title(file_path: Path) -> str:
@@ -332,6 +323,18 @@ def is_file_stable(path: Path) -> bool:
         return False
 
 
+def build_caption(config: dict, sidecar_description: str | None) -> str:
+    """Compose the YouTube description. If pinned_message is set in config,
+    prepend it (acts as the visible-above-the-fold first line)."""
+    yt = config.get("youtube", {})
+    pinned = yt.get("pinned_message", "").strip()
+    body = (sidecar_description if sidecar_description is not None
+            else yt.get("description", "")).strip()
+    if pinned and body:
+        return f"{pinned}\n\n{body}"
+    return pinned or body
+
+
 # -------------------- Per-channel pipeline --------------------
 
 
@@ -343,20 +346,35 @@ def get_catch_up_window(config: dict) -> timedelta:
         return timedelta(minutes=DEFAULT_CATCH_UP_MINUTES)
 
 
-def rebalance_overdue(
-    state: dict, config: dict, channel_name: str
-) -> int:
-    """Push overdue (past + outside catch-up window) unfired slots to the next
-    free future slot. Returns count rebalanced."""
+def resolve_account(
+    config: dict, accounts: dict[str, dict],
+) -> dict | None:
+    """Resolve config's social_account (string username or numeric id) to an
+    account dict. Falls back to legacy `integration_name`."""
+    target = config.get("social_account") or config.get("integration_name") or ""
+    target = str(target).strip()
+    if not target:
+        return None
+    # Numeric id?
+    try:
+        target_id = int(target)
+        for acct in accounts.values():
+            if int(acct.get("id", -1)) == target_id:
+                return acct
+    except ValueError:
+        pass
+    return accounts.get(target.lower())
+
+
+def rebalance_overdue(state: dict, config: dict, channel_name: str) -> int:
     tz = get_schedule_tz(config)
     now = datetime.now(tz)
     catch_up = get_catch_up_window(config)
     rebalanced = 0
-
-    # Sort unfired by current scheduled_for so earliest-overdue rebalanced first
-    unfired = [v for v in state["videos"] if not v.get("fired")]
-    unfired.sort(key=lambda v: v["scheduled_for"])
-
+    unfired = sorted(
+        (v for v in state["videos"] if not v.get("fired")),
+        key=lambda v: v["scheduled_for"],
+    )
     for v in unfired:
         try:
             slot = parse_iso(v["scheduled_for"], tz)
@@ -364,16 +382,13 @@ def rebalance_overdue(
             continue
         if slot + catch_up >= now:
             continue
-        # This slot is too late to fire — push to next free future slot
         used = collect_used_slots(state, tz)
-        # Don't include this video's own current slot in 'used' (we're moving it)
         used.discard(slot.replace(microsecond=0))
-        new_slot = next_free_slot(config, after=now, used_slots=used)
+        new_slot = next_free_slot(config, after=now, used=used)
         log.info(
             "[%s] rebalancing '%s' from %s -> %s (was %s late)",
-            channel_name, v.get("title", v["filename"]),
-            slot.isoformat(), new_slot.isoformat(),
-            now - slot,
+            channel_name, v.get("title", v.get("filename", "?")),
+            slot.isoformat(), new_slot.isoformat(), now - slot,
         )
         v["scheduled_for"] = new_slot.astimezone(timezone.utc).isoformat().replace(
             "+00:00", "Z"
@@ -384,33 +399,31 @@ def rebalance_overdue(
 
 def fire_due_slots(
     s: Settings, state: dict, config: dict,
-    integration: dict, channel_name: str,
+    account: dict, channel_name: str,
 ) -> int:
-    """Fire any unfired slots whose time has arrived (within catch-up window).
-    Returns count fired."""
     tz = get_schedule_tz(config)
     now = datetime.now(tz)
     catch_up = get_catch_up_window(config)
     fired_count = 0
-
-    unfired = [v for v in state["videos"] if not v.get("fired")]
-    unfired.sort(key=lambda v: v["scheduled_for"])
-
+    unfired = sorted(
+        (v for v in state["videos"] if not v.get("fired")),
+        key=lambda v: v["scheduled_for"],
+    )
     for v in unfired:
         try:
             slot = parse_iso(v["scheduled_for"], tz)
         except ValueError:
             continue
         if slot > now:
-            break  # rest are future, sorted
+            break
         if slot + catch_up < now:
-            continue  # too late, will be rebalanced next pass
-        # Fire it now
-        media = v.get("media")
-        if not media or "id" not in media or "path" not in media:
+            continue
+        media = v.get("media") or {}
+        media_id = media.get("id")
+        if not media_id:
             log.error(
-                "[%s] '%s' missing media data, cannot fire — skipping",
-                channel_name, v.get("title", v["filename"]),
+                "[%s] '%s' missing media id, skipping",
+                channel_name, v.get("title", v.get("filename", "?")),
             )
             v["fired"] = True
             v["error"] = "missing_media"
@@ -418,37 +431,36 @@ def fire_due_slots(
         try:
             log.info(
                 "[%s] firing '%s' (slot %s, %.1fs late)",
-                channel_name, v.get("title", v["filename"]),
-                slot.isoformat(), (now - slot).total_seconds(),
+                channel_name, v["title"], slot.isoformat(),
+                (now - slot).total_seconds(),
             )
             response = post_now(
-                s, integration["id"], media, config,
+                s,
+                social_account_id=int(account["id"]),
+                media_id=media_id,
+                caption=v.get("description", ""),
                 title=v["title"],
-                description=v.get("description", ""),
-                tags=v.get("tags", []),
             )
             v["fired"] = True
             v["fired_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             try:
-                v["post_id"] = response[0]["postId"]
-            except (KeyError, IndexError, TypeError):
+                v["post_id"] = response.get("id") or response.get("data", {}).get("id")
+            except Exception:
                 pass
             fired_count += 1
             time.sleep(1)
         except requests.HTTPError as e:
             log.error(
                 "[%s] firing '%s' failed: %s — will retry next cycle",
-                channel_name, v.get("title", v["filename"]), e,
+                channel_name, v.get("title", "?"), e,
             )
-            return fired_count  # stop, retry next loop
+            return fired_count
     return fired_count
 
 
 def discover_and_upload(
     s: Settings, channel_dir: Path, state: dict, config: dict, channel_name: str,
 ) -> int:
-    """Find new videos in source folder, upload them to Postiz, schedule a slot,
-    and move the file to posted/. Returns count uploaded."""
     source_folder = config.get("source_folder")
     inbox = Path(source_folder).expanduser() if source_folder else channel_dir / "inbox"
     posted = channel_dir / "posted"
@@ -460,26 +472,23 @@ def discover_and_upload(
     if not videos:
         return 0
 
-    seen_filenames = {v["filename"] for v in state["videos"]}
+    seen = {v["filename"] for v in state["videos"]}
     yt = config.get("youtube", {})
     title_template = yt.get("title_template", "{smart_title}")
-    default_description = yt.get("description", "")
-    default_tags = list(yt.get("tags", []) or [])
     uploaded = 0
 
     for video in videos:
-        if video.name in seen_filenames:
+        if video.name in seen:
             continue
         if not is_file_stable(video):
-            log.info("[%s] %s still being written, skipping this cycle",
+            log.info("[%s] %s still being written, skipping",
                      channel_name, video.name)
             continue
 
         smart = extract_smart_title(video)
         sidecar = load_sidecar(video) or {}
         title = sidecar.get("title") or title_from_template(title_template, video, smart)
-        description = sidecar.get("description", default_description)
-        tags = sidecar.get("tags", default_tags)
+        description = build_caption(config, sidecar.get("description"))
 
         try:
             slot = first_slot_for_new_video(config, state)
@@ -513,15 +522,14 @@ def discover_and_upload(
             "filename": video.name,
             "title": title,
             "description": description,
-            "tags": tags,
             "scheduled_for": slot.astimezone(timezone.utc)
             .isoformat().replace("+00:00", "Z"),
             "fired": False,
-            "media": {"id": media["id"], "path": media["path"]},
+            "media": media,
             "post_id": None,
             "fired_at": None,
         })
-        seen_filenames.add(video.name)
+        seen.add(video.name)
         uploaded += 1
         save_state(channel_dir, state)
         time.sleep(1)
@@ -529,7 +537,7 @@ def discover_and_upload(
 
 
 def process_channel(
-    s: Settings, channel_dir: Path, integrations: dict[str, dict]
+    s: Settings, channel_dir: Path, accounts: dict[str, dict],
 ) -> None:
     config_path = channel_dir / "config.yaml"
     if not config_path.exists():
@@ -540,26 +548,22 @@ def process_channel(
         log.error("[%s] config.yaml invalid: %s", channel_dir.name, e)
         return
 
-    integ_name = (config.get("integration_name") or "").lower().strip()
-    if not integ_name:
-        log.error("[%s] config.yaml missing 'integration_name'", channel_dir.name)
-        return
-    integ = integrations.get(integ_name)
-    if not integ:
+    account = resolve_account(config, accounts)
+    if not account:
         log.error(
-            "[%s] no Postiz channel %r found. Connected: %s",
-            channel_dir.name, integ_name, list(integrations.keys()),
+            "[%s] no Post Bridge account matches %r. Connected: %s",
+            channel_dir.name,
+            config.get("social_account") or config.get("integration_name"),
+            [a["username"] for a in accounts.values()],
         )
         return
 
     state = load_state(channel_dir)
 
-    rebalanced = rebalance_overdue(state, config, channel_dir.name)
-    if rebalanced:
+    if rebalance_overdue(state, config, channel_dir.name):
         save_state(channel_dir, state)
 
-    fired = fire_due_slots(s, state, config, integ, channel_dir.name)
-    if fired:
+    if fire_due_slots(s, state, config, account, channel_dir.name):
         save_state(channel_dir, state)
 
     discover_and_upload(s, channel_dir, state, config, channel_dir.name)
@@ -575,22 +579,21 @@ def discover_channels(channels_dir: Path) -> list[Path]:
 
 
 def main_loop(s: Settings) -> None:
-    log.info("watcher v2 starting; channels dir: %s", s.channels_dir)
+    log.info("watcher starting (Post Bridge edition); channels: %s", s.channels_dir)
     log.info("API: %s", s.api_url)
     while True:
         try:
-            integrations = fetch_integrations(s)
+            accounts = fetch_social_accounts(s)
         except requests.RequestException as e:
-            log.error("Could not reach Postiz API: %s — retrying in %ds", e, POLL_SECONDS)
+            log.error("Could not reach Post Bridge: %s — retrying in %ds", e, POLL_SECONDS)
             time.sleep(POLL_SECONDS)
             continue
-
         channels = discover_channels(s.channels_dir)
         if not channels:
-            log.info("No channel folders found yet (drop one into %s).", s.channels_dir)
+            log.info("No channel folders yet (drop one into %s).", s.channels_dir)
         for channel_dir in channels:
             try:
-                process_channel(s, channel_dir, integrations)
+                process_channel(s, channel_dir, accounts)
             except Exception as e:
                 log.exception("Error processing %s: %s", channel_dir.name, e)
         time.sleep(POLL_SECONDS)
