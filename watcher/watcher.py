@@ -44,6 +44,11 @@ import requests
 import yaml
 from dotenv import load_dotenv
 
+try:
+    from send2trash import send2trash
+except ImportError:
+    send2trash = None
+
 import ui as ui_module
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"}
@@ -173,6 +178,22 @@ def post_now(
     return r.json()
 
 
+def fetch_post_results(s: Settings, post_id: str) -> list[dict]:
+    """Returns the [{success, error, platform_data}, ...] entries for a post."""
+    try:
+        r = requests.get(
+            f"{s.api_url}/post-results",
+            headers=auth_headers(s),
+            params={"post_id": post_id},
+            timeout=15,
+        )
+        r.raise_for_status()
+        payload = r.json()
+        return payload.get("data", []) if isinstance(payload, dict) else (payload or [])
+    except requests.RequestException:
+        return []
+
+
 # -------------------- State file --------------------
 
 
@@ -266,6 +287,36 @@ def first_slot_for_new_video(config: dict, state: dict) -> datetime:
             except ValueError:
                 log.warning("force_first_slot %r invalid, ignoring", force_first)
     return next_free_slot(config, after=now, used=used)
+
+
+def reschedule_all_queued(state: dict, config: dict) -> int:
+    """Repack every unfired video onto the current schedule, starting from now.
+    Preserves the original order (by previous scheduled_for). Used when the
+    user changes times-per-day or days-of-week and wants the existing queue
+    to follow the new schedule."""
+    tz = get_schedule_tz(config)
+    now = datetime.now(tz)
+    fired_slots: set[datetime] = set()
+    for v in state["videos"]:
+        if v.get("fired"):
+            try:
+                fired_slots.add(parse_iso(v["scheduled_for"], tz))
+            except (KeyError, ValueError):
+                pass
+
+    unfired = [v for v in state["videos"] if not v.get("fired")]
+    unfired.sort(key=lambda v: v.get("scheduled_for", ""))
+
+    used = set(fired_slots)
+    rebalanced = 0
+    for v in unfired:
+        new_slot = next_free_slot(config, after=now, used=used)
+        new_iso = new_slot.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        if v.get("scheduled_for") != new_iso:
+            v["scheduled_for"] = new_iso
+            rebalanced += 1
+        used.add(new_slot)
+    return rebalanced
 
 
 # -------------------- Title / sidecar helpers --------------------
@@ -599,6 +650,86 @@ def discover_and_upload(
     return uploaded
 
 
+def cleanup_published(
+    s: Settings, state: dict, config: dict, channel_dir: Path, channel_name: str,
+) -> int:
+    """For each fired video that hasn't been confirmed published yet, ask
+    Post Bridge for the post-result. If success: capture the YouTube URL and
+    apply the cleanup_after_publish policy to the source file.
+
+    Policies (config.cleanup_after_publish):
+      - 'archive' (default): move to channels/<name>/archive/
+      - 'trash': move to macOS Trash (recoverable)
+      - 'delete': permanent delete
+      - 'none' / 'keep': leave the file in posted/
+    """
+    policy = (config.get("cleanup_after_publish") or "archive").strip().lower()
+    cleaned = 0
+    for v in state["videos"]:
+        if not v.get("fired"):
+            continue
+        if v.get("published_url") or v.get("publish_failed"):
+            continue
+        post_id = v.get("post_id")
+        if not post_id:
+            continue
+        results = fetch_post_results(s, post_id)
+        if not results:
+            continue
+        result = results[0]
+        if not result.get("success"):
+            err = result.get("error")
+            if err:
+                v["publish_failed"] = err
+                log.warning("[%s] publish failed for '%s': %s",
+                            channel_name, v.get("title", "?"), err)
+                cleaned += 1
+            continue
+
+        platform_url = (result.get("platform_data") or {}).get("url")
+        v["published_url"] = platform_url
+        v["result_id"] = result.get("id")
+
+        if policy in ("none", "keep"):
+            cleaned += 1
+            continue
+
+        posted_path = channel_dir / "posted" / v["filename"]
+        if not posted_path.exists():
+            cleaned += 1
+            continue
+
+        try:
+            if policy == "trash":
+                if send2trash is None:
+                    log.warning(
+                        "[%s] cleanup_after_publish=trash but send2trash isn't "
+                        "installed; archiving instead", channel_name,
+                    )
+                    archive = channel_dir / "archive"
+                    archive.mkdir(exist_ok=True)
+                    shutil.move(str(posted_path), str(archive / v["filename"]))
+                else:
+                    send2trash(str(posted_path))
+            elif policy == "delete":
+                posted_path.unlink()
+            else:  # archive (default)
+                archive = channel_dir / "archive"
+                archive.mkdir(exist_ok=True)
+                target = archive / v["filename"]
+                if target.exists():
+                    target = archive / f"{int(time.time())}_{v['filename']}"
+                shutil.move(str(posted_path), str(target))
+            log.info("[%s] published '%s' -> %s; %s file",
+                     channel_name, v.get("title", "?"),
+                     platform_url, policy)
+        except Exception as e:
+            log.exception("[%s] cleanup of %s failed: %s",
+                          channel_name, v["filename"], e)
+        cleaned += 1
+    return cleaned
+
+
 def process_channel(
     s: Settings, channel_dir: Path, accounts: dict[str, dict],
 ) -> None:
@@ -627,6 +758,9 @@ def process_channel(
         save_state(channel_dir, state)
 
     if fire_due_slots(s, state, config, account, channel_dir.name):
+        save_state(channel_dir, state)
+
+    if cleanup_published(s, state, config, channel_dir, channel_dir.name):
         save_state(channel_dir, state)
 
     discover_and_upload(s, channel_dir, state, config, channel_dir.name)

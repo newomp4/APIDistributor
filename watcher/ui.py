@@ -23,6 +23,7 @@ from flask import (
 )
 
 import variants as variants_lib
+import watcher as watcher_lib
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CHANNELS_DIR = PROJECT_ROOT / "channels"
@@ -414,6 +415,10 @@ def channel_detail(name: str):
             slot_input = ""
         title_html = html_escape(v.get("title", v["filename"]))
         meta_bits = []
+        if v.get("published_url"):
+            meta_bits.append(f'<a href="{html_escape(v["published_url"])}" target="_blank" rel="noopener">▶ on YouTube</a>')
+        if v.get("publish_failed"):
+            meta_bits.append(f'<span class="pill err"><span class="dot"></span>publish failed</span>')
         if v.get("post_id"):
             meta_bits.append(f'<span class="mono">post {html_escape(v["post_id"][:10])}…</span>')
         vu = v.get("variants_used") or {}
@@ -488,6 +493,11 @@ def channel_detail(name: str):
         <a class="btn tiny ghost{(' active' if filt=='all' else '')}" href="?filter=all">All</a>
         <a class="btn tiny ghost{(' active' if filt=='queued' else '')}" href="?filter=queued">Queued</a>
         <a class="btn tiny ghost{(' active' if filt=='fired' else '')}" href="?filter=fired">Fired</a>
+        <form method="post" action="/channel/{name}/reschedule-all"
+              onsubmit="return confirm('Repack ALL queued videos onto the current schedule, starting from now? This applies your latest times/days settings to videos that were scheduled with old settings. Fired videos are untouched.');"
+              style="display:inline; margin-left:8px;">
+          <button class="subtle tiny" type="submit" title="Apply current schedule to all queued videos">↻ Reschedule all</button>
+        </form>
       </div>
     </div>
     {table_html}
@@ -688,6 +698,19 @@ def fire_now(name: str, idx: int):
         abort(400)
     state["videos"][idx]["scheduled_for"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     write_state(channel_dir, state)
+    return redirect(url_for("channel_detail", name=name))
+
+
+@app.route("/channel/<name>/reschedule-all", methods=["POST"])
+def reschedule_all(name: str):
+    """Repack every unfired video onto the current config's schedule, starting
+    from now. Use this after editing the schedule (times/days)."""
+    if not safe_name(name):
+        abort(400)
+    channel_dir, config, state = load_channel(name)
+    n = watcher_lib.reschedule_all_queued(state, config)
+    if n:
+        write_state(channel_dir, state)
     return redirect(url_for("channel_detail", name=name))
 
 

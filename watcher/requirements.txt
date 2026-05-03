@@ -2,3 +2,4 @@ requests>=2.31
 pyyaml>=6.0
 python-dotenv>=1.0
 flask>=3.0
+send2trash>=1.8

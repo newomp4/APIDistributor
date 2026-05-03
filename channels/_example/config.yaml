@@ -14,6 +14,13 @@ move_after_post: true
 # How late can a slot fire before we push it to the next free slot?
 catch_up_window_minutes: 30
 
+# What to do with the source file once Post Bridge confirms it's live on YouTube:
+#   archive (default) - move to channels/<name>/archive/
+#   trash             - move to macOS Trash (recoverable, frees disk)
+#   delete            - permanent delete (frees disk immediately)
+#   none              - leave file in posted/
+cleanup_after_publish: archive
+
 schedule:
   # Daily slot times in the channel timezone (24-hour).
   times: ["09:00", "18:00"]
