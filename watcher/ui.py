@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -565,6 +566,13 @@ def channel_detail(name: str):
       <a class="btn ghost" href="/channel/{name}/variants">Variants ({variants_summary})</a>
     </div>
 
+    <div class="row" style="margin-top:14px; gap:8px; flex-wrap:wrap;">
+      <form method="post" action="/channel/{name}/open/source" style="display:inline;"><button class="subtle tiny" type="submit" title="Open the folder where the watcher looks for new videos">📁 Source folder</button></form>
+      <form method="post" action="/channel/{name}/open/posted" style="display:inline;"><button class="subtle tiny" type="submit" title="Files that have been uploaded to Post Bridge but not yet published">📁 Posted</button></form>
+      <form method="post" action="/channel/{name}/open/archive" style="display:inline;"><button class="subtle tiny" type="submit" title="Files moved here after YouTube confirms publish (when cleanup_after_publish is 'archive')">📁 Archive</button></form>
+      <form method="post" action="/channel/{name}/open/channel" style="display:inline;"><button class="subtle tiny" type="submit" title="The channel's project folder (config.yaml lives here)">📁 Channel folder</button></form>
+    </div>
+
     <h2>Schedule</h2>
     <div class="card">
       <div class="row" style="gap:36px;">
@@ -941,52 +949,153 @@ def bonus_today(name: str):
 def add_channel():
     integrations = fetch_integrations()
     options_html = "".join(
-        f'<option value="{html_escape(i["username"])}">{html_escape(i["username"])} ({html_escape(i["platform"])})</option>'
+        f'<option value="{html_escape(i["username"])}" data-platform="{html_escape(i["platform"])}">{html_escape(i["username"])} ({html_escape(i["platform"])})</option>'
         for i in integrations
     )
     if not options_html:
         options_html = '<option value="">⚠️ No accounts found — connect a channel in Post Bridge first</option>'
 
+    existing = [c.name for c in channel_dirs()]
+    template_options = ''.join(f'<option value="{html_escape(c)}">{html_escape(c)}</option>' for c in existing)
+
+    days_checkboxes = "".join(
+        f'<label class="chk"><input type="checkbox" name="days" value="{d}" checked>{d}</label>'
+        for d in ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+    )
+
     body = f"""
     <h1>Add a channel</h1>
-    <p class="subhead">Creates a new folder under <code>channels/</code> with a fresh <code>config.yaml</code>.</p>
-    <form method="post" action="/add" class="card" style="max-width:680px;">
-      <div class="field">
-        <label>Folder name <span class="muted-2">(lowercase letters, digits, underscores)</span></label>
-        <input name="name" type="text" placeholder="my_new_channel" required pattern="[a-z0-9_]{{1,40}}">
-      </div>
+    <p class="subhead">Creates a new folder under <code>channels/</code> with a fresh <code>config.yaml</code>. Pre-fills as much as possible.</p>
+
+    <form method="post" action="/add" class="card" style="max-width:760px;" id="addform">
+
+      {f'<div class="field"><label>Copy settings from existing channel <span class="muted-2">(optional — uses their schedule / description / pinned message)</span></label><select id="tpl-channel"><option value="">— start fresh —</option>{template_options}</select></div>' if template_options else ''}
+
       <div class="field">
         <label>Post Bridge account</label>
-        <select name="social_account" required>{options_html}</select>
+        <select name="social_account" id="acct-select" required>
+          <option value="">— pick one —</option>
+          {options_html}
+        </select>
+      </div>
+
+      <div class="field">
+        <label>Folder name <span class="muted-2">(auto-filled from account; lowercase letters/digits/underscores)</span></label>
+        <input name="name" id="folder-name" type="text" placeholder="my_new_channel" required pattern="[a-z0-9_]{{1,40}}">
+      </div>
+
+      <div class="field">
+        <label>Source folder <span class="muted-2">(absolute path. Empty = use this channel's <code>inbox/</code>. Folder is auto-created if it doesn't exist.)</span></label>
+        <input name="source_folder" id="source-folder" type="text" placeholder="/Users/owen/myfactory/output">
+      </div>
+
+      <div class="field">
+        <label>Schedule presets</label>
+        <div class="row" style="gap:6px;">
+          <button class="subtle tiny" type="button" data-times="09:00, 18:00">2 / day</button>
+          <button class="subtle tiny" type="button" data-times="08:00, 13:00, 18:00">3 / day</button>
+          <button class="subtle tiny" type="button" data-times="08:00, 11:00, 14:00, 17:00, 20:00">5 / day</button>
+          <button class="subtle tiny" type="button" data-times="08:00, 10:30, 13:00, 15:30, 18:00, 20:30">6 / day</button>
+          <button class="subtle tiny" type="button" data-times="07:00, 09:00, 11:00, 13:00, 15:00, 17:00, 19:00, 21:00">8 / day</button>
+        </div>
       </div>
       <div class="field">
-        <label>Source folder <span class="muted-2">(absolute path; videos picked up here. Empty = use channels/&lt;name&gt;/inbox/)</span></label>
-        <input name="source_folder" type="text" placeholder="/Users/you/myfactory/output">
+        <label>Times <span class="muted-2">(24-hour, comma-separated, channel timezone)</span></label>
+        <input name="times" id="sched-times" type="text" value="09:00, 18:00">
       </div>
+
       <div class="field">
-        <label>Schedule — comma-separated times <span class="muted-2">(24-hour, channel timezone)</span></label>
-        <input name="times" type="text" value="09:00, 18:00">
+        <label>Days of week</label>
+        <div class="row" style="gap:8px; flex-wrap:wrap;">{days_checkboxes}</div>
+        <div class="row" style="gap:6px; margin-top:6px;">
+          <button class="subtle tiny" type="button" data-days="Mon Tue Wed Thu Fri Sat Sun">Every day</button>
+          <button class="subtle tiny" type="button" data-days="Mon Tue Wed Thu Fri">Weekdays</button>
+          <button class="subtle tiny" type="button" data-days="Sat Sun">Weekends</button>
+        </div>
       </div>
-      <div class="field">
-        <label>Days of week <span class="muted-2">(space-separated)</span></label>
-        <input name="days" type="text" value="Mon Tue Wed Thu Fri Sat Sun">
-      </div>
+
       <div class="field">
         <label>Timezone <span class="muted-2">(IANA format)</span></label>
-        <input name="timezone" type="text" value="America/New_York">
+        <input name="timezone" id="tz" type="text" value="America/New_York" list="tz-list">
+        <datalist id="tz-list">
+          <option value="America/New_York">
+          <option value="America/Chicago">
+          <option value="America/Denver">
+          <option value="America/Los_Angeles">
+          <option value="Europe/London">
+          <option value="Europe/Berlin">
+          <option value="Asia/Tokyo">
+          <option value="Australia/Sydney">
+          <option value="UTC">
+        </datalist>
       </div>
+
       <div class="field">
-        <label>YouTube title template <span class="muted-2">(use <code>{{smart_title}}</code> for filename-derived title)</span></label>
-        <input name="title_template" type="text" value="{{smart_title}}">
+        <label>YouTube title template <span class="muted-2">(<code>{{smart_title}}</code> = filename-derived title)</span></label>
+        <input name="title_template" id="title-tpl" type="text" value="{{smart_title}}">
       </div>
+
       <div class="field">
-        <label>Description <span class="muted-2">(visible above-fold first line; use the Variants page after creating to add many)</span></label>
-        <textarea name="description" placeholder="Subscribe for more!"></textarea>
+        <label>Pinned message <span class="muted-2">(first line of every description, visible above the fold — substitute for a pinned comment)</span></label>
+        <input name="pinned_message" id="pinned" type="text" placeholder="👇 Earn money like this 👇">
       </div>
+
+      <div class="field">
+        <label>Description</label>
+        <textarea name="description" id="desc" placeholder="Subscribe for more!"></textarea>
+      </div>
+
       <div class="row" style="margin-top:6px;">
         <button type="submit">Create channel</button>
       </div>
     </form>
+
+    <style>
+      .chk {{ display:inline-flex; align-items:center; gap:6px; padding:6px 10px; background:var(--bg); border:1px solid var(--border); border-radius:6px; cursor:pointer; user-select:none; font-size:13px; }}
+      .chk:has(input:checked) {{ background:rgba(122,162,255,0.10); border-color:rgba(122,162,255,0.40); color:var(--accent); }}
+      .chk input {{ width:auto; margin:0; }}
+    </style>
+
+    <script>
+      // ------- Auto-fill folder name from account username -------
+      function slug(s) {{ return s.toLowerCase().replace(/[^a-z0-9_]+/g,'_').replace(/^_+|_+$/g,'').slice(0,40) || 'my_channel'; }}
+      const acct = document.getElementById('acct-select');
+      const folderName = document.getElementById('folder-name');
+      let folderTouched = false;
+      folderName.addEventListener('input', () => folderTouched = true);
+      acct.addEventListener('change', () => {{
+        if (!folderTouched && acct.value) folderName.value = slug(acct.value);
+      }});
+
+      // ------- Schedule preset buttons -------
+      document.querySelectorAll('button[data-times]').forEach(b => b.addEventListener('click', () => {{
+        document.getElementById('sched-times').value = b.dataset.times;
+      }}));
+      document.querySelectorAll('button[data-days]').forEach(b => b.addEventListener('click', () => {{
+        const wanted = new Set(b.dataset.days.split(/\\s+/));
+        document.querySelectorAll('input[name=days]').forEach(cb => cb.checked = wanted.has(cb.value));
+      }}));
+
+      // ------- Copy settings from existing channel -------
+      const tpl = document.getElementById('tpl-channel');
+      if (tpl) tpl.addEventListener('change', async () => {{
+        if (!tpl.value) return;
+        const r = await fetch('/api/channel/' + tpl.value + '/config');
+        if (!r.ok) return;
+        const cfg = await r.json();
+        const sched = cfg.schedule || {{}};
+        const yt = cfg.youtube || {{}};
+        if (sched.times)    document.getElementById('sched-times').value = sched.times.join(', ');
+        if (sched.timezone) document.getElementById('tz').value = sched.timezone;
+        if (sched.days) {{
+          const wanted = new Set(sched.days);
+          document.querySelectorAll('input[name=days]').forEach(cb => cb.checked = wanted.has(cb.value));
+        }}
+        if (yt.title_template) document.getElementById('title-tpl').value = yt.title_template;
+        if (yt.pinned_message) document.getElementById('pinned').value = yt.pinned_message;
+        if (yt.description)    document.getElementById('desc').value = yt.description;
+      }});
+    </script>
     """
     return render("Add Channel", body, active="add")
 
@@ -1001,13 +1110,15 @@ def add_channel_post():
         return render("Error", f'<h1>Folder {html_escape(name)} already exists</h1><a href="/add">Back</a>'), 400
 
     times = [t.strip() for t in request.form.get("times", "").split(",") if t.strip()]
-    days = request.form.get("days", "").split()
+    days = request.form.getlist("days") or request.form.get("days", "").split()
+    source_folder = request.form.get("source_folder", "").strip() or None
 
-    config = {
+    config: dict = {
         "social_account": request.form.get("social_account", "").strip(),
-        "source_folder": request.form.get("source_folder", "").strip() or None,
         "move_after_post": True,
         "catch_up_window_minutes": 30,
+        "cleanup_after_publish": "archive",
+        "prescheduling_window_hours": 8,
         "schedule": {
             "times": times,
             "days": days,
@@ -1015,21 +1126,78 @@ def add_channel_post():
         },
         "youtube": {
             "title_template": request.form.get("title_template", "{smart_title}").strip(),
-            "pinned_message": "",
+            "pinned_message": request.form.get("pinned_message", "").strip(),
             "description": request.form.get("description", "").strip() or "Subscribe for more!",
         },
     }
-    if not config["source_folder"]:
-        del config["source_folder"]
+    if source_folder:
+        config["source_folder"] = source_folder
 
     target.mkdir(parents=True)
     (target / "inbox").mkdir(exist_ok=True)
     (target / "posted").mkdir(exist_ok=True)
+    if source_folder:
+        try:
+            Path(source_folder).expanduser().mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass  # don't block creation if path can't be made (e.g. read-only fs)
     write_config(target, config)
-    return redirect(url_for("channel_detail", name=name))
+    return redirect(url_for("channel_detail", name=name, flash=f"Channel created"))
+
+
+# -------------------- folder reveal --------------------
+
+
+def _resolve_folder(channel_dir: Path, config: dict, which: str) -> Path | None:
+    """Return the absolute path for a folder kind, or None if not applicable."""
+    which = (which or "").lower()
+    if which == "source":
+        sf = config.get("source_folder")
+        if sf:
+            p = Path(sf).expanduser()
+            return p
+        return channel_dir / "inbox"
+    if which == "inbox":
+        return channel_dir / "inbox"
+    if which == "posted":
+        return channel_dir / "posted"
+    if which == "archive":
+        return channel_dir / "archive"
+    if which == "channel":
+        return channel_dir
+    return None
+
+
+@app.route("/channel/<name>/open/<which>", methods=["POST"])
+def open_folder(name: str, which: str):
+    """Reveal a folder in Finder via macOS `open`. Creates the folder first
+    if it doesn't exist (so the user can immediately drop files in)."""
+    if not safe_name(name):
+        abort(400)
+    channel_dir, config, _ = load_channel(name)
+    target = _resolve_folder(channel_dir, config, which)
+    if target is None:
+        return redirect(url_for("channel_detail", name=name, flash=f"Unknown folder: {which}"))
+    target.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.Popen(["open", str(target)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        return redirect(url_for("channel_detail", name=name, flash=f"open failed: {e}"))
+    return redirect(url_for("channel_detail", name=name, flash=f"Opened {target.name}/ in Finder"))
 
 
 # -------------------- API --------------------
+
+
+@app.route("/api/channel/<name>/config")
+def api_channel_config(name: str):
+    """Return a channel's parsed config.yaml as JSON. Used by Add-Channel
+    form to populate "copy settings from existing channel"."""
+    if not safe_name(name):
+        abort(400)
+    _, config, _ = load_channel(name)
+    return jsonify(config)
 
 
 @app.route("/api/status")
