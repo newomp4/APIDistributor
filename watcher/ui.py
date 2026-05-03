@@ -558,6 +558,19 @@ def channel_detail(name: str):
     else:
         warmup_html = ''
 
+    # Buffer status: how many unfired videos have media uploaded vs target
+    buffer_target = int(config.get("media_buffer_size", 0) or 0)
+    buffer_uploaded = sum(
+        1 for v in state.get("videos", [])
+        if not v.get("fired") and not v.get("published_url")
+        and (v.get("media") or {}).get("id")
+    )
+    buffer_remaining_local = sum(
+        1 for v in state.get("videos", [])
+        if not v.get("fired") and not v.get("published_url")
+        and not (v.get("media") or {}).get("id")
+    )
+
     body = f"""
     <a href="/" class="muted">← All channels</a>
     <h1 style="margin-top:10px;">{html_escape(name)}</h1>
@@ -592,6 +605,7 @@ def channel_detail(name: str):
         <div><div class="muted-2">Jitter</div><div><strong>{('±' + str(sched.get('jitter_minutes', 0)) + ' min') if sched.get('jitter_minutes', 0) else 'off'}</strong></div></div>
         <div><div class="muted-2">Catch-up</div><div><strong>{config.get('catch_up_window_minutes', 30)} min</strong></div></div>
         <div><div class="muted-2">Pre-schedule</div><div><strong>{config.get('prescheduling_window_hours', 8)}h ahead</strong></div></div>
+        <div><div class="muted-2">PB media buffer</div><div><strong>{buffer_uploaded}{f"/{buffer_target}" if buffer_target else ""} ready{f" · {buffer_remaining_local} local-only" if buffer_remaining_local else ""}</strong></div></div>
         {warmup_html}
       </div>
     </div>
@@ -1028,6 +1042,11 @@ def add_channel():
       </div>
 
       <div class="field">
+        <label>Pre-uploaded buffer <span class="muted-2">(how many of the next-up videos to upload to Post Bridge in advance — the rest stay local on your Mac until they get close to firing)</span></label>
+        <input name="media_buffer_size" type="number" min="0" max="200" value="10" style="max-width:140px;">
+      </div>
+
+      <div class="field">
         <label>Time jitter <span class="muted-2">(randomize each upload ±N min around its base time — looks more human, less robotic to YouTube)</span></label>
         <div class="row" style="gap:6px;">
           <button class="subtle tiny" type="button" data-jitter="0">Off</button>
@@ -1190,12 +1209,18 @@ def add_channel_post():
         ],
     }
 
+    try:
+        buffer_size = max(0, int(request.form.get("media_buffer_size", "10")))
+    except ValueError:
+        buffer_size = 10
+
     config: dict = {
         "social_account": request.form.get("social_account", "").strip(),
         "move_after_post": True,
         "catch_up_window_minutes": 30,
         "cleanup_after_publish": "archive",
         "prescheduling_window_hours": 8,
+        "media_buffer_size": buffer_size,
         "schedule": {
             "times": times,
             "days": days,

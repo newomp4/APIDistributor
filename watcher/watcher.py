@@ -705,13 +705,27 @@ def fire_due_slots(
         media = v.get("media") or {}
         media_id = media.get("id")
         if not media_id:
-            log.error(
-                "[%s] '%s' missing media id, skipping",
-                channel_name, v.get("title", v.get("filename", "?")),
-            )
-            v["fired"] = True
-            v["error"] = "missing_media"
-            continue
+            # Buffer hasn't caught up yet. Try a just-in-time upload from the
+            # local file before firing, so a "fire now" doesn't have to wait
+            # for a separate buffer-fill cycle.
+            local = v.get("local_path")
+            if not local or not Path(local).expanduser().exists():
+                log.warning(
+                    "[%s] '%s' due to fire but has no media + no local file; "
+                    "leaving for manual intervention",
+                    channel_name, v.get("title", "?"),
+                )
+                continue
+            try:
+                log.info("[%s] just-in-time upload for due slot '%s'",
+                         channel_name, v["title"])
+                media = upload_media(s, Path(local).expanduser())
+                v["media"] = media
+                media_id = media["id"]
+            except Exception as e:
+                log.error("[%s] just-in-time upload failed for '%s': %s",
+                          channel_name, v["title"], e)
+                return fired_count
         try:
             log.info(
                 "[%s] firing '%s' (slot %s, %.1fs late)",
@@ -742,9 +756,13 @@ def fire_due_slots(
     return fired_count
 
 
-def discover_and_upload(
+def discover_and_register(
     s: Settings, channel_dir: Path, state: dict, config: dict, channel_name: str,
 ) -> int:
+    """Scan source folder for new videos. For each new file, pick a slot,
+    move the file to posted/ (or leave in source if move_after_post=False),
+    and register it in state. The actual Post Bridge media upload happens
+    later in ensure_media_buffer."""
     source_folder = config.get("source_folder")
     inbox = Path(source_folder).expanduser() if source_folder else channel_dir / "inbox"
     posted = channel_dir / "posted"
@@ -757,7 +775,7 @@ def discover_and_upload(
         return 0
 
     seen = {v["filename"] for v in state["videos"]}
-    uploaded = 0
+    registered = 0
 
     for video in videos:
         if video.name in seen:
@@ -777,29 +795,19 @@ def discover_and_upload(
             slot = first_slot_for_new_video(config, state)
         except RuntimeError as e:
             log.error("[%s] %s", channel_name, e)
-            return uploaded
-
-        log.info(
-            "[%s] uploading %s as '%s' -> slot %s",
-            channel_name, video.name, title, slot.isoformat(),
-        )
-
-        try:
-            media = upload_media(s, video)
-        except requests.HTTPError as e:
-            log.error("[%s] upload of %s failed: %s — will retry next cycle",
-                      channel_name, video.name, e)
-            return uploaded
-        except Exception as e:
-            log.exception("[%s] upload of %s exception: %s",
-                          channel_name, video.name, e)
-            return uploaded
+            return registered
 
         if move_after_post:
             target = posted / video.name
             if target.exists():
                 target = posted / f"{int(time.time())}_{video.name}"
             shutil.move(str(video), str(target))
+            local_path = str(target)
+        else:
+            local_path = str(video)
+
+        log.info("[%s] registered %s -> slot %s",
+                 channel_name, video.name, slot.isoformat())
 
         state["videos"].append({
             "filename": video.name,
@@ -809,14 +817,71 @@ def discover_and_upload(
             "scheduled_for": slot.astimezone(timezone.utc)
             .isoformat().replace("+00:00", "Z"),
             "fired": False,
-            "media": media,
+            "media": None,
+            "local_path": local_path,
             "post_id": None,
             "fired_at": None,
         })
         seen.add(video.name)
-        uploaded += 1
+        registered += 1
         save_state(channel_dir, state)
-        time.sleep(0.3)
+    return registered
+
+
+def ensure_media_buffer(
+    s: Settings, state: dict, config: dict, channel_name: str,
+) -> int:
+    """Maintain a rolling buffer of pre-uploaded media on Post Bridge.
+
+    The next N unfired videos (by schedule order) should have their media
+    bytes uploaded so a fire/pre-schedule call is instant. Beyond N, files
+    stay local on disk (in posted/). When videos fire and drop out of the
+    queue, the buffer naturally tops up.
+
+    `media_buffer_size: 0` disables (== eager upload of every discovered video,
+    which is the legacy behaviour for entries already in state).
+    """
+    try:
+        target = int(config.get("media_buffer_size", 10))
+    except (TypeError, ValueError):
+        target = 10
+    if target <= 0:
+        return 0
+
+    unfired = sorted(
+        [v for v in state["videos"]
+         if not v.get("fired") and not v.get("published_url")],
+        key=lambda v: v.get("scheduled_for", ""),
+    )
+    already = sum(1 for v in unfired if (v.get("media") or {}).get("id"))
+    if already >= target:
+        return 0
+
+    needed = target - already
+    candidates = [v for v in unfired if not (v.get("media") or {}).get("id")]
+    uploaded = 0
+    for v in candidates[:needed]:
+        local = v.get("local_path")
+        if not local:
+            continue
+        path = Path(local).expanduser()
+        if not path.exists():
+            log.warning(
+                "[%s] buffer top-up: %s missing on disk, skipping",
+                channel_name, path,
+            )
+            continue
+        try:
+            log.info("[%s] buffer top-up: uploading %s",
+                     channel_name, path.name)
+            media = upload_media(s, path)
+            v["media"] = media
+            uploaded += 1
+            time.sleep(0.3)
+        except Exception as e:
+            log.error("[%s] buffer top-up failed for %s: %s",
+                      channel_name, path.name, e)
+            return uploaded
     return uploaded
 
 
@@ -996,18 +1061,26 @@ def process_channel(
     if rebalance_overdue(state, config, channel_dir.name):
         save_state(channel_dir, state)
 
-    # Pre-schedule rolling window FIRST so Post Bridge has them queued; then
-    # fire any that are due RIGHT NOW (catches up if watcher was offline).
+    # 1. Find new files, register them in state (no Post Bridge upload yet).
+    if discover_and_register(s, channel_dir, state, config, channel_dir.name):
+        save_state(channel_dir, state)
+
+    # 2. Make sure the next N (media_buffer_size) videos have their bytes
+    #    uploaded to Post Bridge. Most files stay local on disk.
+    if ensure_media_buffer(s, state, config, channel_dir.name):
+        save_state(channel_dir, state)
+
+    # 3. Pre-schedule rolling window so PB has them queued for firing.
     if preschedule_upcoming(s, state, config, account, channel_dir.name):
         save_state(channel_dir, state)
 
+    # 4. Fire anything due right now (catches up if watcher was offline).
     if fire_due_slots(s, state, config, account, channel_dir.name):
         save_state(channel_dir, state)
 
+    # 5. Once PB confirms YouTube success, capture URL + clean up local file.
     if cleanup_published(s, state, config, channel_dir, channel_dir.name):
         save_state(channel_dir, state)
-
-    discover_and_upload(s, channel_dir, state, config, channel_dir.name)
 
 
 def discover_channels(channels_dir: Path) -> list[Path]:

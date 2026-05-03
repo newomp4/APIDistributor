@@ -14,6 +14,12 @@ move_after_post: true
 # How late can a slot fire before we push it to the next free slot?
 catch_up_window_minutes: 30
 
+# How many of the next-up videos should be pre-uploaded to Post Bridge so
+# they're ready to fire instantly. Files beyond this count stay local on
+# your Mac (in posted/) until the buffer drains. 0 disables (always lazy,
+# upload at fire time). Default 10.
+media_buffer_size: 10
+
 # What to do with the source file once Post Bridge confirms it's live on YouTube:
 #   archive (default) - move to channels/<name>/archive/
 #   trash             - move to macOS Trash (recoverable, frees disk)
