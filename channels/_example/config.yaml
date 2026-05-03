@@ -31,6 +31,22 @@ schedule:
   # IANA timezone (America/New_York, Europe/London, Asia/Tokyo, ...)
   timezone: "America/New_York"
 
+  # Randomize each upload's actual time ±N minutes around the base slot.
+  # 0 = exact times every day (looks robotic to YouTube). 15-30 is sensible.
+  jitter_minutes: 30
+
+# Warmup: gradually ramp up posts/day for new channels so YouTube doesn't
+# flag the sudden volume as automation. Each step says "after this many days
+# of channel age, run this many slots/day from `times`" (always taken from
+# the start of the list).
+# Remove this whole block (or use empty `ramp: []`) to disable.
+warmup:
+  ramp:
+    - {after_days: 0,  per_day: 1}   # day 1-2: 1/day
+    - {after_days: 3,  per_day: 2}   # day 3-6: 2/day
+    - {after_days: 7,  per_day: 3}   # day 7-13: 3/day
+    - {after_days: 14, per_day: 999} # day 14+: full schedule
+
 youtube:
   # {smart_title} = filename with dashes turned into a Title Case sentence
   # (the video ID suffix from yt-dlp output gets stripped automatically).

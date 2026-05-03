@@ -548,6 +548,16 @@ def channel_detail(name: str):
 
     pill_overdue = "ok" if stats['overdue'] == 0 else "warn"
 
+    warmup_cfg = config.get("warmup") or {}
+    if warmup_cfg.get("ramp"):
+        today = datetime.now(tz).date()
+        age = watcher_lib.channel_age_days(state, today, tz)
+        per_day = watcher_lib.per_day_for(config, age)
+        total = len(sched.get("times", []))
+        warmup_html = f'<div><div class="muted-2">Warmup</div><div><strong>day {age} · {per_day}/{total} slots active today</strong></div></div>'
+    else:
+        warmup_html = ''
+
     body = f"""
     <a href="/" class="muted">← All channels</a>
     <h1 style="margin-top:10px;">{html_escape(name)}</h1>
@@ -575,11 +585,14 @@ def channel_detail(name: str):
 
     <h2>Schedule</h2>
     <div class="card">
-      <div class="row" style="gap:36px;">
+      <div class="row" style="gap:36px; flex-wrap:wrap;">
         <div><div class="muted-2">Times</div><div><strong>{', '.join(sched.get('times', [])) or '(none)'}</strong></div></div>
         <div><div class="muted-2">Days</div><div><strong>{' '.join(sched.get('days', [])) or '(all)'}</strong></div></div>
         <div><div class="muted-2">Timezone</div><div><strong>{sched.get('timezone','UTC')}</strong></div></div>
+        <div><div class="muted-2">Jitter</div><div><strong>{('±' + str(sched.get('jitter_minutes', 0)) + ' min') if sched.get('jitter_minutes', 0) else 'off'}</strong></div></div>
         <div><div class="muted-2">Catch-up</div><div><strong>{config.get('catch_up_window_minutes', 30)} min</strong></div></div>
+        <div><div class="muted-2">Pre-schedule</div><div><strong>{config.get('prescheduling_window_hours', 8)}h ahead</strong></div></div>
+        {warmup_html}
       </div>
     </div>
 
@@ -1015,6 +1028,29 @@ def add_channel():
       </div>
 
       <div class="field">
+        <label>Time jitter <span class="muted-2">(randomize each upload ±N min around its base time — looks more human, less robotic to YouTube)</span></label>
+        <div class="row" style="gap:6px;">
+          <button class="subtle tiny" type="button" data-jitter="0">Off</button>
+          <button class="subtle tiny" type="button" data-jitter="15">±15 min</button>
+          <button class="subtle tiny" type="button" data-jitter="30">±30 min</button>
+          <button class="subtle tiny" type="button" data-jitter="60">±60 min</button>
+        </div>
+        <input name="jitter_minutes" id="jitter" type="number" min="0" max="720" value="30" style="margin-top:6px; max-width:120px;">
+      </div>
+
+      <div class="field">
+        <label>Warmup ramp <span class="muted-2">(new channels: start slow, ramp to full schedule. Looks like organic growth.)</span></label>
+        <div class="row" style="gap:6px;">
+          <button class="subtle tiny" type="button" data-warmup="off">Off</button>
+          <button class="subtle tiny" type="button" data-warmup="slow">Slow (14 days)</button>
+          <button class="subtle tiny" type="button" data-warmup="medium">Medium (7 days)</button>
+          <button class="subtle tiny" type="button" data-warmup="aggressive">Aggressive (3 days)</button>
+        </div>
+        <input name="warmup_preset" id="warmup-preset" type="hidden" value="off">
+        <div id="warmup-summary" class="muted-2" style="margin-top:6px;">No warmup — full schedule from day 1.</div>
+      </div>
+
+      <div class="field">
         <label>Timezone <span class="muted-2">(IANA format)</span></label>
         <input name="timezone" id="tz" type="text" value="America/New_York" list="tz-list">
         <datalist id="tz-list">
@@ -1075,6 +1111,21 @@ def add_channel():
         const wanted = new Set(b.dataset.days.split(/\\s+/));
         document.querySelectorAll('input[name=days]').forEach(cb => cb.checked = wanted.has(cb.value));
       }}));
+      document.querySelectorAll('button[data-jitter]').forEach(b => b.addEventListener('click', () => {{
+        document.getElementById('jitter').value = b.dataset.jitter;
+      }}));
+
+      const warmupSummaries = {{
+        off:        'No warmup — full schedule from day 1.',
+        slow:       'Slow ramp: 1/d for 3 days → 2/d → 3/d → 4/d → full at day 14.',
+        medium:     'Medium ramp: 1/d for 2 days → 2/d → 3/d → full at day 7.',
+        aggressive: 'Aggressive ramp: 1/d for 1 day → 3/d → full at day 3.',
+      }};
+      document.querySelectorAll('button[data-warmup]').forEach(b => b.addEventListener('click', () => {{
+        const v = b.dataset.warmup;
+        document.getElementById('warmup-preset').value = v;
+        document.getElementById('warmup-summary').textContent = warmupSummaries[v] || '';
+      }}));
 
       // ------- Copy settings from existing channel -------
       const tpl = document.getElementById('tpl-channel');
@@ -1112,6 +1163,32 @@ def add_channel_post():
     times = [t.strip() for t in request.form.get("times", "").split(",") if t.strip()]
     days = request.form.getlist("days") or request.form.get("days", "").split()
     source_folder = request.form.get("source_folder", "").strip() or None
+    try:
+        jitter = max(0, int(request.form.get("jitter_minutes", "30")))
+    except ValueError:
+        jitter = 30
+
+    warmup_preset = request.form.get("warmup_preset", "off")
+    warmup_ramps = {
+        "slow": [
+            {"after_days": 0, "per_day": 1},
+            {"after_days": 3, "per_day": 2},
+            {"after_days": 7, "per_day": 3},
+            {"after_days": 10, "per_day": 4},
+            {"after_days": 14, "per_day": 999},
+        ],
+        "medium": [
+            {"after_days": 0, "per_day": 1},
+            {"after_days": 2, "per_day": 2},
+            {"after_days": 4, "per_day": 3},
+            {"after_days": 7, "per_day": 999},
+        ],
+        "aggressive": [
+            {"after_days": 0, "per_day": 1},
+            {"after_days": 1, "per_day": 3},
+            {"after_days": 3, "per_day": 999},
+        ],
+    }
 
     config: dict = {
         "social_account": request.form.get("social_account", "").strip(),
@@ -1123,6 +1200,7 @@ def add_channel_post():
             "times": times,
             "days": days,
             "timezone": request.form.get("timezone", "UTC").strip(),
+            "jitter_minutes": jitter,
         },
         "youtube": {
             "title_template": request.form.get("title_template", "{smart_title}").strip(),
@@ -1130,6 +1208,8 @@ def add_channel_post():
             "description": request.form.get("description", "").strip() or "Subscribe for more!",
         },
     }
+    if warmup_preset in warmup_ramps:
+        config["warmup"] = {"ramp": warmup_ramps[warmup_preset]}
     if source_folder:
         config["source_folder"] = source_folder
 

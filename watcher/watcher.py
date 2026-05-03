@@ -245,30 +245,83 @@ def parse_iso(s: str, default_tz: ZoneInfo) -> datetime:
     return dt
 
 
+def channel_age_days(state: dict, target_day, tz: ZoneInfo) -> int:
+    """How many days the channel has been live as of `target_day`. Determined
+    by the earliest scheduled video; returns 0 if none yet."""
+    earliest = None
+    for v in state.get("videos", []):
+        try:
+            d = datetime.fromisoformat(v["scheduled_for"].replace("Z", "+00:00")).astimezone(tz).date()
+            if earliest is None or d < earliest:
+                earliest = d
+        except (KeyError, ValueError):
+            continue
+    if earliest is None:
+        return 0
+    return max(0, (target_day - earliest).days)
+
+
+def per_day_for(config: dict, age_days: int) -> int:
+    """Number of slots/day active given the channel's age, respecting warmup.
+    Falls back to the full `times` list if no warmup is configured."""
+    times = config.get("schedule", {}).get("times", [])
+    full = len(times) if times else 0
+    warmup = config.get("warmup") or {}
+    ramp = warmup.get("ramp") or []
+    if not ramp or not full:
+        return full
+    active = full
+    for step in sorted(ramp, key=lambda s: int(s.get("after_days", 0))):
+        if age_days >= int(step.get("after_days", 0)):
+            active = int(step.get("per_day", full))
+    return max(0, min(active, full))
+
+
 def next_free_slot(
     config: dict, after: datetime, used: set[datetime],
+    state: dict | None = None,
 ) -> datetime:
+    """Find the next free schedule slot strictly after `after`. Honors:
+      - schedule.times / days / timezone
+      - warmup.ramp (if state given): caps per_day for early days
+      - schedule.jitter_minutes: randomizes the actual time ±N min around the base
+    """
     sched = config.get("schedule", {})
     times = sched.get("times", ["12:00"])
-    days = set(sched.get("days", DAY_NAMES))
+    days_allowed = set(sched.get("days", DAY_NAMES))
     tz = get_schedule_tz(config)
     after_local = after.astimezone(tz)
     used_local = {dt.astimezone(tz).replace(microsecond=0) for dt in used}
+    try:
+        jitter = max(0, int(sched.get("jitter_minutes", 0)))
+    except (TypeError, ValueError):
+        jitter = 0
+    # Tolerance for "is this base slot taken?" — wider when jitter could move
+    # neighboring slots toward each other.
+    used_tolerance_sec = max(60, jitter * 30)
+
     for offset in range(0, 365):
         candidate = after_local.date() + timedelta(days=offset)
-        if DAY_NAMES[candidate.weekday()] not in days:
+        if DAY_NAMES[candidate.weekday()] not in days_allowed:
             continue
-        for tstr in times:
-            hh, mm = parse_time_of_day(tstr)
-            slot = datetime(
+        per_day = per_day_for(config, channel_age_days(state or {}, candidate, tz))
+        active_times = times[:per_day] if per_day > 0 else times
+        for tstr in active_times:
+            try:
+                hh, mm = parse_time_of_day(tstr)
+            except ValueError:
+                continue
+            base = datetime(
                 candidate.year, candidate.month, candidate.day,
                 hh, mm, tzinfo=tz,
             )
-            if slot <= after_local:
+            if base <= after_local + timedelta(minutes=2):
                 continue
-            if slot.replace(microsecond=0) in used_local:
+            if any(abs((base - u).total_seconds()) < used_tolerance_sec for u in used_local):
                 continue
-            return slot
+            if jitter > 0:
+                base = base + timedelta(minutes=random.randint(-jitter, jitter))
+            return base
     raise RuntimeError("No free slot in 365 days.")
 
 
@@ -296,7 +349,7 @@ def first_slot_for_new_video(config: dict, state: dict) -> datetime:
                 log.info("force_first_slot %s passed, using regular schedule", forced)
             except ValueError:
                 log.warning("force_first_slot %r invalid, ignoring", force_first)
-    return next_free_slot(config, after=now, used=used)
+    return next_free_slot(config, after=now, used=used, state=state)
 
 
 def cancel_postbridge_post(s: Settings, post_id: str) -> bool:
@@ -353,7 +406,7 @@ def reschedule_all_queued(state: dict, config: dict, s: Settings | None = None) 
     used = set(fired_slots)
     rebalanced = 0
     for v in queued_or_prescheduled:
-        new_slot = next_free_slot(config, after=now, used=used)
+        new_slot = next_free_slot(config, after=now, used=used, state=state)
         new_iso = new_slot.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
         if v.get("scheduled_for") != new_iso:
             unschedule_video(s, v)
@@ -608,7 +661,7 @@ def rebalance_overdue(state: dict, config: dict, channel_name: str) -> int:
             continue
         used = collect_used_slots(state, tz)
         used.discard(slot.replace(microsecond=0))
-        new_slot = next_free_slot(config, after=now, used=used)
+        new_slot = next_free_slot(config, after=now, used=used, state=state)
         log.info(
             "[%s] rebalancing '%s' from %s -> %s (was %s late)",
             channel_name, v.get("title", v.get("filename", "?")),
