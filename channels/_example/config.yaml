@@ -1,0 +1,38 @@
+# Copy this folder to give a new channel its own folder, e.g. channels/pet_facts/
+# Each setting below is documented inline.
+
+# The exact display name of the channel as it appears in Postiz (case-insensitive).
+# Look at your Postiz dashboard → connected channels list to see the name.
+integration_name: "MyYouTubeChannelName"
+
+# When videos in inbox/ should be scheduled to upload.
+schedule:
+  # Local times (24-hour). Each entry is a daily slot.
+  times: ["09:00", "18:00"]
+
+  # Days of week to post on.
+  days: [Mon, Tue, Wed, Thu, Fri, Sat, Sun]
+
+  # IANA timezone (e.g. America/New_York, Europe/London, Asia/Tokyo).
+  timezone: "America/New_York"
+
+# YouTube-specific settings applied to every upload from this folder.
+youtube:
+  # The YouTube title. {filename} is replaced with the video filename (no extension).
+  # Must end up between 2 and 100 characters.
+  title_template: "{filename}"
+
+  # Description shown beneath the video.
+  description: |
+    Subscribe for more!
+
+  # public | unlisted | private
+  privacy: "public"
+
+  # "yes" or "no" — whether the video is made-for-kids (COPPA).
+  made_for_kids: "no"
+
+  # Tags applied to every upload (list of strings).
+  tags:
+    - shorts
+    - tutorial

@@ -1,0 +1,37 @@
+# Secrets — NEVER commit these
+.env
+.env.local
+.env.*.local
+
+# Per-user channel configs and runtime state
+# (channels/_example/ is the only one tracked, as a template)
+channels/*/
+!channels/_example/
+
+# Watcher state (per-user runtime data)
+**/_state.json
+
+# Watched media (videos, sidecar JSON metadata)
+**/inbox/
+**/posted/
+**/*.mp4
+**/*.mov
+**/*.m4v
+**/*.webm
+**/*.avi
+**/*.mkv
+
+# Soft-deleted channels (archived by UI)
+.deleted_channels/
+
+# Python venv & caches
+watcher/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
