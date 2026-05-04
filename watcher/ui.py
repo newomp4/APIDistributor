@@ -307,18 +307,11 @@ tr.next-up td:first-child::before {
 
 /* Hero stats — big numbers on Performance page */
 .hero-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px,1fr)); gap: 12px; margin-bottom: 24px; }
-.hero-card { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 20px; transition: border-color var(--transition); position: relative; overflow: hidden; }
+.hero-card { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 20px; transition: border-color var(--transition); }
 .hero-card:hover { border-color: var(--border-strong); }
-.hero-card::before { content:""; position: absolute; top:0; left:0; right:0; height:2px; background: linear-gradient(90deg, var(--accent), var(--accent-2)); opacity: 0.5; }
 .hero-card .label { font-size: 11px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; }
 .hero-card .value { font-size: 28px; font-weight: 700; margin-top: 6px; letter-spacing: -0.02em; line-height: 1; }
 .hero-card .sub { font-size: 11px; color: var(--text-3); margin-top: 6px; }
-
-/* Channel cards on dashboard get a thin accent strip */
-.channel-card { position: relative; overflow: hidden; }
-.channel-card::before { content:""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: linear-gradient(180deg, var(--accent), var(--accent-2)); opacity: 0.6; }
-.channel-card.attention::before { background: var(--warn); }
-.channel-card.problem::before { background: var(--err); }
 
 /* Section header with subtle icon support */
 h2 .h2-icon { display: inline-block; opacity: 0.6; margin-right: 6px; font-size: 14px; vertical-align: 1px; }
@@ -666,9 +659,8 @@ def dashboard():
 
         histo_html = fired_histogram_html(state_full, config_full)
 
-        accent_cls = "channel-card" + (f" {health_cls}" if health_cls in ("attention", "problem") else "")
         cards_html += f"""
-        <a class="card-link" href="/channel/{c['name']}"><div class="card {accent_cls}" data-channel="{c['name']}">
+        <a class="card-link" href="/channel/{c['name']}"><div class="card" data-channel="{c['name']}">
           <div class="card-row spread"><h3>{html_escape(c['name'])}</h3>
             <span class="health-pill {health_cls}">{html_escape(health_lbl)}</span>
           </div>
