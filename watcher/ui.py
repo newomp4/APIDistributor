@@ -122,26 +122,37 @@ def today_strip_html(state: dict, config: dict) -> str:
         markers.append(
             f'<div class="slot-marker {cls}" style="left:{pct:.2f}%;" title="{time_str}: {title}"></div>'
         )
-    grid_lines = ""
-    for h in (0, 6, 12, 18):
+    grid_items = ""
+    label_map = {0: "12am", 6: "6am", 12: "noon", 18: "6pm", 24: "12am"}
+    for h in (0, 6, 12, 18, 24):
         x = h / 24 * 100
-        label_str = f"{h:02d}h" if h > 0 else "12am"
-        if h == 12:
-            label_str = "noon"
-        elif h == 6:
-            label_str = "6am"
-        elif h == 18:
-            label_str = "6pm"
-        grid_lines += f'<div class="grid-line" style="left:{x:.2f}%;"></div>'
-        grid_lines += f'<div class="grid-label" style="left:{x:.2f}%;">{label_str}</div>'
+        anchor_cls = ""
+        if h == 0:
+            anchor_cls = " anchor-start"
+        elif h == 24:
+            anchor_cls = " anchor-end"
+        # Don't draw a grid LINE at the very edges (border serves as it)
+        if 0 < h < 24:
+            grid_items += f'<div class="grid-line" style="left:{x:.2f}%;"></div>'
+        grid_items += (
+            f'<div class="grid-label{anchor_cls}" style="left:{x:.2f}%;">'
+            f'{label_map[h]}</div>'
+        )
+
+    # Now-line + label: anchor specially if extremely close to either edge
+    now_anchor = ""
+    if now_pct < 6:
+        now_anchor = " anchor-start"
+    elif now_pct > 94:
+        now_anchor = " anchor-end"
 
     return (
-        f'<div class="today-strip">'
-        f'{grid_lines}'
+        f'<div class="today-strip"><div class="strip-inner">'
+        f'{grid_items}'
         f'<div class="now-line" style="left:{now_pct:.2f}%;"></div>'
-        f'<div class="now-label" style="left:{now_pct:.2f}%;">now</div>'
+        f'<div class="now-label{now_anchor}" style="left:{now_pct:.2f}%;">now</div>'
         f'{"".join(markers)}'
-        f'</div>'
+        f'</div></div>'
     )
 
 
@@ -275,12 +286,15 @@ tr.next-up td:first-child::before {
 }
 
 /* Today's timeline strip */
-.today-strip { position: relative; height: 38px; margin-top: 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
-.today-strip .grid-line { position: absolute; top: 0; bottom: 0; width: 1px; background: rgba(255,255,255,0.04); }
-.today-strip .grid-label { position: absolute; bottom: 2px; font-size: 9px; color: var(--text-3); transform: translateX(-50%); font-family: ui-monospace, monospace; }
-.today-strip .now-line { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--accent); box-shadow: 0 0 8px rgba(122,162,255,0.6); z-index: 5; }
-.today-strip .now-label { position: absolute; top: 2px; font-size: 9px; color: var(--accent); transform: translateX(-50%); font-weight: 700; z-index: 6; }
-.today-strip .slot-marker { position: absolute; top: 8px; width: 14px; height: 14px; border-radius: 50%; transform: translateX(-50%); border: 2px solid var(--bg); cursor: help; transition: transform 0.15s; }
+.today-strip { position: relative; height: 44px; margin-top: 10px; padding: 0 6px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; }
+.today-strip .strip-inner { position: relative; height: 100%; }
+.today-strip .grid-line { position: absolute; top: 0; bottom: 14px; width: 1px; background: rgba(255,255,255,0.06); }
+.today-strip .grid-label { position: absolute; bottom: 0; font-size: 10px; color: var(--text-3); transform: translateX(-50%); font-family: ui-monospace, monospace; padding: 1px 0; }
+.today-strip .grid-label.anchor-start { transform: none; left: 0 !important; }
+.today-strip .grid-label.anchor-end { transform: translateX(-100%); }
+.today-strip .now-line { position: absolute; top: 0; bottom: 14px; width: 2px; background: var(--accent); box-shadow: 0 0 8px rgba(122,162,255,0.6); z-index: 5; }
+.today-strip .now-label { position: absolute; top: 0; font-size: 9px; color: var(--accent); transform: translateX(-50%); font-weight: 700; z-index: 6; padding: 0 4px; background: var(--bg); border-radius: 3px; }
+.today-strip .slot-marker { position: absolute; top: 8px; width: 12px; height: 12px; border-radius: 50%; transform: translateX(-50%); border: 2px solid var(--bg); cursor: help; transition: transform 0.15s; z-index: 4; }
 .today-strip .slot-marker:hover { transform: translateX(-50%) scale(1.4); z-index: 10; }
 .today-strip .slot-marker.posted   { background: var(--ok); }
 .today-strip .slot-marker.fired    { background: var(--accent); }
@@ -926,13 +940,13 @@ def channel_detail(name: str):
 
     <h2 style="margin-top:28px;"><span class="h2-icon">⚡</span>Quick actions</h2>
     <div class="card">
-      <form method="post" action="/channel/{name}/bonus-today" class="row" style="align-items:flex-end; gap:14px;">
-        <div style="flex:1; min-width:280px;">
-          <label style="display:block; font-size:12px; color:var(--text-2); margin-bottom:6px; font-weight:500;">Add bonus posts today</label>
-          <input name="times" type="text" placeholder="21:00, 22:30, 23:45" required>
-          <div class="muted-2" style="margin-top:4px;">Comma-separated times today (24-hour). Pulls the next queued videos forward to those times.</div>
+      <form method="post" action="/channel/{name}/bonus-today">
+        <label style="display:block; font-size:12px; color:var(--text-2); margin-bottom:6px; font-weight:500;">Add bonus posts today</label>
+        <div class="row" style="gap:10px; align-items:stretch;">
+          <input name="times" type="text" placeholder="21:00, 22:30, 23:45" required style="flex:1; min-width:240px;">
+          <button type="submit" title="Pull queued videos forward to extra slots today" style="white-space:nowrap;">Pull videos to today</button>
         </div>
-        <button type="submit" title="Pull queued videos forward to extra slots today">Pull videos to today</button>
+        <div class="muted-2" style="margin-top:6px;">Comma-separated times today (24-hour). Pulls the next queued videos forward to those times.</div>
       </form>
       <div class="divider"></div>
       <div class="row" style="gap:8px; flex-wrap:wrap;">
