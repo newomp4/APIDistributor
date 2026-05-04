@@ -92,6 +92,115 @@ def write_state(channel_dir: Path, state: dict) -> None:
     (channel_dir / "_state.json").write_text(json.dumps(state, indent=2))
 
 
+def today_strip_html(state: dict, config: dict) -> str:
+    """Horizontal time-of-day strip showing today's videos as colored dots,
+    with a marker for current time. 0..24 hours mapped to 0..100% width."""
+    tz = ZoneInfo(config.get("schedule", {}).get("timezone", "UTC"))
+    now = datetime.now(tz)
+    today = now.date()
+    now_pct = (now.hour * 60 + now.minute) / (24 * 60) * 100
+
+    markers = []
+    for v in state.get("videos", []):
+        try:
+            slot = datetime.fromisoformat(v["scheduled_for"].replace("Z", "+00:00")).astimezone(tz)
+        except (KeyError, ValueError):
+            continue
+        if slot.date() != today:
+            continue
+        pct = (slot.hour * 60 + slot.minute) / (24 * 60) * 100
+        if v.get("published_url"):
+            cls = "posted"
+        elif v.get("publish_failed"):
+            cls = "failed"
+        elif v.get("fired"):
+            cls = "fired"
+        else:
+            cls = "queued"
+        title = html_escape(v.get("title", v.get("filename", "?"))[:80])
+        time_str = slot.strftime("%-I:%M %p")
+        markers.append(
+            f'<div class="slot-marker {cls}" style="left:{pct:.2f}%;" title="{time_str}: {title}"></div>'
+        )
+    grid_lines = ""
+    for h in (0, 6, 12, 18):
+        x = h / 24 * 100
+        label_str = f"{h:02d}h" if h > 0 else "12am"
+        if h == 12:
+            label_str = "noon"
+        elif h == 6:
+            label_str = "6am"
+        elif h == 18:
+            label_str = "6pm"
+        grid_lines += f'<div class="grid-line" style="left:{x:.2f}%;"></div>'
+        grid_lines += f'<div class="grid-label" style="left:{x:.2f}%;">{label_str}</div>'
+
+    return (
+        f'<div class="today-strip">'
+        f'{grid_lines}'
+        f'<div class="now-line" style="left:{now_pct:.2f}%;"></div>'
+        f'<div class="now-label" style="left:{now_pct:.2f}%;">now</div>'
+        f'{"".join(markers)}'
+        f'</div>'
+    )
+
+
+def fired_histogram_html(state: dict, config: dict, days: int = 7) -> str:
+    """Tiny bar chart of fired-count per day for the last N days."""
+    tz = ZoneInfo(config.get("schedule", {}).get("timezone", "UTC"))
+    today = datetime.now(tz).date()
+    counts: dict = {today - timedelta(days=i): 0 for i in range(days - 1, -1, -1)}
+    for v in state.get("videos", []):
+        if not v.get("fired"):
+            continue
+        ts = v.get("fired_at") or v.get("scheduled_for")
+        if not ts:
+            continue
+        try:
+            d = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(tz).date()
+        except Exception:
+            continue
+        if d in counts:
+            counts[d] += 1
+    max_count = max(counts.values()) or 1
+    bars = ""
+    for d, n in counts.items():
+        h_pct = (n / max_count) * 100 if max_count else 0
+        cls = "has" if n > 0 else ""
+        if d == today:
+            cls = (cls + " today").strip()
+        title = f"{d.strftime('%a %b %-d')}: {n} fired"
+        bars += f'<div class="bar {cls}" style="height:{max(h_pct,4):.0f}%;" title="{title}"></div>'
+    return f'<div class="histo">{bars}</div>'
+
+
+def channel_health(stats: dict, config: dict, state: dict, pb_ok: bool) -> tuple[str, str]:
+    """Returns (css_class, label) for an at-a-glance status pill."""
+    if not pb_ok:
+        return "problem", "PB offline"
+    failed = sum(1 for v in state.get("videos", []) if v.get("publish_failed"))
+    if failed:
+        return "problem", f"{failed} failed"
+    if stats["overdue"] > 0:
+        return "attention", f"{stats['overdue']} overdue"
+    buffer_target = int(config.get("media_buffer_size", 0) or 0)
+    if buffer_target > 0:
+        buffer_uploaded = sum(
+            1 for v in state.get("videos", [])
+            if not v.get("fired") and not v.get("published_url")
+            and (v.get("media") or {}).get("id")
+        )
+        unfired = sum(
+            1 for v in state.get("videos", [])
+            if not v.get("fired") and not v.get("published_url")
+        )
+        if buffer_uploaded < min(buffer_target, unfired) * 0.5 and unfired > 0:
+            return "attention", "buffer low"
+    if stats["queued"] == 0:
+        return "attention", "queue empty"
+    return "healthy", "healthy"
+
+
 def channel_stats(state: dict, config: dict) -> dict:
     tz = ZoneInfo(config.get("schedule", {}).get("timezone", "UTC"))
     now = datetime.now(tz)
@@ -164,6 +273,36 @@ tr.next-up td:first-child::before {
   letter-spacing: 0.08em; color: var(--accent); background: rgba(122,162,255,0.15);
   padding: 2px 6px; border-radius: 4px; margin-right: 8px; vertical-align: 2px;
 }
+
+/* Today's timeline strip */
+.today-strip { position: relative; height: 38px; margin-top: 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.today-strip .grid-line { position: absolute; top: 0; bottom: 0; width: 1px; background: rgba(255,255,255,0.04); }
+.today-strip .grid-label { position: absolute; bottom: 2px; font-size: 9px; color: var(--text-3); transform: translateX(-50%); font-family: ui-monospace, monospace; }
+.today-strip .now-line { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--accent); box-shadow: 0 0 8px rgba(122,162,255,0.6); z-index: 5; }
+.today-strip .now-label { position: absolute; top: 2px; font-size: 9px; color: var(--accent); transform: translateX(-50%); font-weight: 700; z-index: 6; }
+.today-strip .slot-marker { position: absolute; top: 8px; width: 14px; height: 14px; border-radius: 50%; transform: translateX(-50%); border: 2px solid var(--bg); cursor: help; transition: transform 0.15s; }
+.today-strip .slot-marker:hover { transform: translateX(-50%) scale(1.4); z-index: 10; }
+.today-strip .slot-marker.posted   { background: var(--ok); }
+.today-strip .slot-marker.fired    { background: var(--accent); }
+.today-strip .slot-marker.queued   { background: var(--warn); }
+.today-strip .slot-marker.failed   { background: var(--err); }
+
+/* Health badges */
+.health-pill { display:inline-flex; align-items:center; gap:6px; font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 999px; }
+.health-pill.healthy { background: rgba(52,211,153,0.10); color: var(--ok); border: 1px solid rgba(52,211,153,0.25); }
+.health-pill.attention { background: rgba(251,191,36,0.10); color: var(--warn); border: 1px solid rgba(251,191,36,0.30); }
+.health-pill.problem { background: rgba(248,113,113,0.10); color: var(--err); border: 1px solid rgba(248,113,113,0.30); }
+
+/* Progress bars */
+.progress-bar { height: 6px; background: var(--bg); border-radius: 3px; overflow: hidden; border: 1px solid var(--border); }
+.progress-bar .fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width 0.3s; }
+.progress-bar .fill.full { background: linear-gradient(90deg, var(--ok), #4ade80); }
+
+/* Mini histogram for last-7-days fired */
+.histo { display: flex; align-items: flex-end; gap: 3px; height: 28px; margin-top: 6px; }
+.histo .bar { flex: 1; background: var(--bg-3); border-radius: 2px 2px 0 0; min-height: 2px; transition: background 0.2s; }
+.histo .bar.has { background: var(--accent); }
+.histo .bar.today { background: var(--accent-2); box-shadow: 0 0 0 1px rgba(167,139,250,0.40); }
 
 :root {
   --bg: #0a0b0f;
@@ -431,7 +570,19 @@ def dashboard():
     pb_ok = integ_count > 0
     cards_html = ""
     for c in cards:
-        pill_class = "ok" if c["overdue"] == 0 else "warn"
+        # Load full state/config so we can compute health + histogram
+        chan_dir = CHANNELS_DIR / c["name"]
+        config_full = yaml.safe_load((chan_dir / "config.yaml").read_text()) or {}
+        state_full = {"videos": []}
+        sf = chan_dir / "_state.json"
+        if sf.exists():
+            try:
+                state_full = json.loads(sf.read_text())
+            except json.JSONDecodeError:
+                pass
+        stats_full = channel_stats(state_full, config_full)
+        health_cls, health_lbl = channel_health(stats_full, config_full, state_full, pb_ok)
+
         last_posted_html = ""
         if c.get("last_posted_iso"):
             try:
@@ -446,18 +597,23 @@ def dashboard():
         else:
             last_posted_html = '<div class="muted-2" style="margin-top:6px;">Last posted: <em>never</em></div>'
 
+        histo_html = fired_histogram_html(state_full, config_full)
+
         cards_html += f"""
         <a class="card-link" href="/channel/{c['name']}"><div class="card" data-channel="{c['name']}">
           <div class="card-row spread"><h3>{html_escape(c['name'])}</h3>
-            <span class="pill {pill_class}" data-stat="overdue-pill"><span class="dot"></span><span data-stat="overdue">{c['overdue']}</span> overdue</span>
+            <span class="health-pill {health_cls}">{html_escape(health_lbl)}</span>
           </div>
           <div class="muted-2" style="margin-top:4px;">{html_escape(c['integration'])} · {html_escape(c['times'])}</div>
           <div class="card-row" style="margin-top:14px;">
             <span class="stat"><strong data-stat="queued">{c['queued']}</strong> queued</span>
             <span class="stat"><strong data-stat="fired">{c['fired']}</strong> fired</span>
+            <span class="stat"><strong data-stat="overdue">{c['overdue']}</strong> overdue</span>
           </div>
           <div class="muted-2" style="margin-top:10px;">Next: <span data-stat="next">{html_escape(c['next_slot'] or '— nothing queued —')}</span></div>
           {last_posted_html}
+          <div class="muted-2" style="margin-top:10px;">Last 7 days</div>
+          {histo_html}
         </div></a>
         """
 
@@ -647,6 +803,23 @@ def channel_detail(name: str):
         if not v.get("fired") and not v.get("published_url")
         and not (v.get("media") or {}).get("id")
     )
+    buffer_html = ""
+    if buffer_target > 0:
+        pct = min(100, int((buffer_uploaded / buffer_target) * 100))
+        full_cls = " full" if buffer_uploaded >= buffer_target else ""
+        buffer_html = (
+            f'<div><div class="muted-2">PB media buffer</div>'
+            f'<div><strong>{buffer_uploaded}/{buffer_target}</strong>'
+            f'{f" · {buffer_remaining_local} local" if buffer_remaining_local else ""}</div>'
+            f'<div class="progress-bar" style="margin-top:6px; width:160px;">'
+            f'<div class="fill{full_cls}" style="width:{pct}%;"></div></div></div>'
+        )
+    else:
+        buffer_html = (
+            f'<div><div class="muted-2">PB media buffer</div>'
+            f'<div><strong>{buffer_uploaded}</strong>'
+            f'{f" · {buffer_remaining_local} local" if buffer_remaining_local else ""}</div></div>'
+        )
 
     body = f"""
     <a href="/" class="muted">← All channels</a>
@@ -682,9 +855,10 @@ def channel_detail(name: str):
         <div><div class="muted-2">Jitter</div><div><strong>{('±' + str(sched.get('jitter_minutes', 0)) + ' min') if sched.get('jitter_minutes', 0) else 'off'}</strong></div></div>
         <div><div class="muted-2">Catch-up</div><div><strong>{config.get('catch_up_window_minutes', 30)} min</strong></div></div>
         <div><div class="muted-2">Pre-schedule</div><div><strong>{config.get('prescheduling_window_hours', 8)}h ahead</strong></div></div>
-        <div><div class="muted-2">PB media buffer</div><div><strong>{buffer_uploaded}{f"/{buffer_target}" if buffer_target else ""} ready{f" · {buffer_remaining_local} local-only" if buffer_remaining_local else ""}</strong></div></div>
+        {buffer_html}
         {warmup_html}
       </div>
+      <div style="margin-top:18px;"><div class="muted-2" style="margin-bottom:4px;">Today's plan</div>{today_strip_html(state, config)}</div>
     </div>
 
     <h2 style="margin-top:28px;">Quick actions</h2>
