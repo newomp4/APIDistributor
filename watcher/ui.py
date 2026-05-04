@@ -305,6 +305,24 @@ tr.next-up td:first-child::before {
 .histo .bar.has { background: var(--accent); }
 .histo .bar.today { background: var(--accent-2); box-shadow: 0 0 0 1px rgba(167,139,250,0.40); }
 
+/* Hero stats — big numbers on Performance page */
+.hero-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px,1fr)); gap: 12px; margin-bottom: 24px; }
+.hero-card { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 20px; transition: border-color var(--transition); position: relative; overflow: hidden; }
+.hero-card:hover { border-color: var(--border-strong); }
+.hero-card::before { content:""; position: absolute; top:0; left:0; right:0; height:2px; background: linear-gradient(90deg, var(--accent), var(--accent-2)); opacity: 0.5; }
+.hero-card .label { font-size: 11px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; }
+.hero-card .value { font-size: 28px; font-weight: 700; margin-top: 6px; letter-spacing: -0.02em; line-height: 1; }
+.hero-card .sub { font-size: 11px; color: var(--text-3); margin-top: 6px; }
+
+/* Channel cards on dashboard get a thin accent strip */
+.channel-card { position: relative; overflow: hidden; }
+.channel-card::before { content:""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: linear-gradient(180deg, var(--accent), var(--accent-2)); opacity: 0.6; }
+.channel-card.attention::before { background: var(--warn); }
+.channel-card.problem::before { background: var(--err); }
+
+/* Section header with subtle icon support */
+h2 .h2-icon { display: inline-block; opacity: 0.6; margin-right: 6px; font-size: 14px; vertical-align: 1px; }
+
 :root {
   --bg: #0a0b0f;
   --bg-2: #14161d;
@@ -522,6 +540,25 @@ JS = """
       } catch (err) {}
     });
   });
+
+  // Loading state on form submits — disables the button + shows an ellipsis
+  // so it's clear the action is in flight.
+  document.querySelectorAll('form').forEach(form => {
+    form.addEventListener('submit', () => {
+      const btn = form.querySelector('button[type=submit]');
+      if (!btn || btn.dataset.skipLoading === '1') return;
+      btn.disabled = true;
+      btn.dataset.origLabel = btn.textContent;
+      btn.textContent = btn.textContent.trim().replace(/[⏵▶↻↑↓+×]\\s*/, '') + ' …';
+      btn.style.opacity = '0.65';
+    });
+  });
+
+  // Auto-dismiss flash messages after 4s with a fade.
+  document.querySelectorAll('.flash-pill').forEach(p => {
+    setTimeout(() => { p.style.transition = 'opacity 0.4s'; p.style.opacity = '0'; }, 4000);
+    setTimeout(() => p.remove(), 4500);
+  });
 })();
 """
 
@@ -545,7 +582,7 @@ BASE = """
     {% endif %}
     <a href="{{ url_for('add_channel') }}" {% if active=='add' %}class="active"{% endif %}>+ Add</a>
     <span class="nav-spacer"></span>
-    {% if flash %}<span class="pill ok"><span class="dot"></span>{{ flash }}</span>{% endif %}
+    {% if flash %}<span class="pill ok flash-pill"><span class="dot"></span>{{ flash }}</span>{% endif %}
     <span class="meta">{{ api }}</span>
   </div>
 </header>
@@ -629,8 +666,9 @@ def dashboard():
 
         histo_html = fired_histogram_html(state_full, config_full)
 
+        accent_cls = "channel-card" + (f" {health_cls}" if health_cls in ("attention", "problem") else "")
         cards_html += f"""
-        <a class="card-link" href="/channel/{c['name']}"><div class="card" data-channel="{c['name']}">
+        <a class="card-link" href="/channel/{c['name']}"><div class="card {accent_cls}" data-channel="{c['name']}">
           <div class="card-row spread"><h3>{html_escape(c['name'])}</h3>
             <span class="health-pill {health_cls}">{html_escape(health_lbl)}</span>
           </div>
@@ -879,7 +917,7 @@ def channel_detail(name: str):
       <form method="post" action="/channel/{name}/open/channel" style="display:inline;"><button class="subtle tiny" type="submit" title="The channel's project folder (config.yaml lives here)">📁 Channel folder</button></form>
     </div>
 
-    <h2>Schedule</h2>
+    <h2><span class="h2-icon">🗓</span>Schedule</h2>
     <div class="card">
       <div class="row" style="gap:36px; flex-wrap:wrap;">
         <div><div class="muted-2">Times</div><div><strong>{', '.join(sched.get('times', [])) or '(none)'}</strong></div></div>
@@ -894,7 +932,7 @@ def channel_detail(name: str):
       <div style="margin-top:18px;"><div class="muted-2" style="margin-bottom:4px;">Today's plan</div>{today_strip_html(state, config)}</div>
     </div>
 
-    <h2 style="margin-top:28px;">Quick actions</h2>
+    <h2 style="margin-top:28px;"><span class="h2-icon">⚡</span>Quick actions</h2>
     <div class="card">
       <form method="post" action="/channel/{name}/bonus-today" class="row" style="align-items:flex-end; gap:14px;">
         <div style="flex:1; min-width:280px;">
@@ -1318,14 +1356,14 @@ def channel_performance(name: str):
     </div>
     <p class="subhead">{len(with_stats)} of {len(published)} published videos have analytics{f' · last sync <span data-when="{last_sync_ms}">…</span>' if last_sync_ms else ''}</p>
 
-    <div class="grid" style="grid-template-columns: repeat(auto-fill, minmax(180px,1fr)); margin-bottom:24px;">
-      <div class="card"><div class="muted-2">Total views</div><h2 style="margin:6px 0 0; font-size:24px;">{total_views:,}</h2></div>
-      <div class="card"><div class="muted-2">Total likes</div><h2 style="margin:6px 0 0; font-size:24px;">{total_likes:,}</h2></div>
-      <div class="card"><div class="muted-2">Total comments</div><h2 style="margin:6px 0 0; font-size:24px;">{total_comments:,}</h2></div>
-      <div class="card"><div class="muted-2">Avg views / post</div><h2 style="margin:6px 0 0; font-size:24px;">{avg_views:,.0f}</h2></div>
+    <div class="hero-grid">
+      <div class="hero-card"><div class="label">Total views</div><div class="value">{total_views:,}</div><div class="sub">across {len(with_stats)} posts</div></div>
+      <div class="hero-card"><div class="label">Total likes</div><div class="value">{total_likes:,}</div><div class="sub">{(total_likes/total_views*100) if total_views else 0:.1f}% engagement</div></div>
+      <div class="hero-card"><div class="label">Comments</div><div class="value">{total_comments:,}</div><div class="sub">{(total_comments/total_views*100) if total_views else 0:.2f}% rate</div></div>
+      <div class="hero-card"><div class="label">Avg views / post</div><div class="value">{avg_views:,.0f}</div><div class="sub">across all published</div></div>
     </div>
 
-    <h2>Top performers</h2>
+    <h2><span class="h2-icon">📈</span>Top performers</h2>
     <div class="row" style="margin-bottom:8px;">
       <a class="btn tiny ghost{(' active' if sort_by=='views' else '')}" href="?sort=views">By views</a>
       <a class="btn tiny ghost{(' active' if sort_by=='likes' else '')}" href="?sort=likes">By likes</a>
@@ -1334,13 +1372,13 @@ def channel_performance(name: str):
     </div>
     {f'<table><thead><tr><th>#</th><th>Title</th><th>Views</th><th>Likes</th><th>Comments</th><th>Shares</th><th>Posted</th></tr></thead><tbody>{rows_top}</tbody></table>' if rows_top else '<div class="empty">No analytics yet. Click <strong>Sync now</strong> above (Post Bridge usually takes a few hours after publish to surface the first numbers).</div>'}
 
-    <h2 style="margin-top:32px;">A/B test — Description variants</h2>
+    <h2 style="margin-top:32px;"><span class="h2-icon">🧪</span>A/B test — Description variants</h2>
     {render_variant_table('Description', desc_rows)}
 
-    <h2 style="margin-top:24px;">A/B test — Pinned message variants</h2>
+    <h2 style="margin-top:24px;"><span class="h2-icon">📌</span>A/B test — Pinned message variants</h2>
     {render_variant_table('Pinned message', pinned_rows)}
 
-    <h2 style="margin-top:32px;">Best posting times</h2>
+    <h2 style="margin-top:32px;"><span class="h2-icon">⏰</span>Best posting times</h2>
     <p class="subhead">Top hours by average views: {best_hours_summary}</p>
     <div class="hour-grid">{hours_html}</div>
     """
