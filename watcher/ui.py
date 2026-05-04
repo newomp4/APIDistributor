@@ -156,6 +156,51 @@ def today_strip_html(state: dict, config: dict) -> str:
     )
 
 
+def todays_progress_html(state: dict, config: dict) -> tuple[str, str]:
+    """Returns (dots_html, summary_text) for today's posting progress."""
+    tz = ZoneInfo(config.get("schedule", {}).get("timezone", "UTC"))
+    today = datetime.now(tz).date()
+
+    todays: list[tuple[datetime, dict]] = []
+    for v in state.get("videos", []):
+        try:
+            slot = datetime.fromisoformat(v["scheduled_for"].replace("Z", "+00:00")).astimezone(tz)
+        except (KeyError, ValueError):
+            continue
+        if slot.date() == today:
+            todays.append((slot, v))
+    if not todays:
+        return "", "Nothing on for today"
+    todays.sort(key=lambda iv: iv[0])
+
+    posted = 0
+    fired_only = 0
+    queued = 0
+    failed = 0
+    dots_html = ""
+    for slot, v in todays:
+        if v.get("publish_failed"):
+            cls = "failed"; failed += 1
+        elif v.get("published_url"):
+            cls = "posted"; posted += 1
+        elif v.get("fired"):
+            cls = "fired"; fired_only += 1
+        else:
+            cls = "queued"; queued += 1
+        title_attr = html_escape(slot.strftime('%-I:%M %p') + ' · ' + v.get("title", v.get("filename", "?"))[:60])
+        dots_html += f'<span class="day-dot {cls}" title="{title_attr}"></span>'
+
+    done = posted + fired_only
+    total = len(todays)
+    if queued > 0:
+        summary = f"{done}/{total} sent · {queued} more today"
+    elif failed:
+        summary = f"{done}/{total} sent · {failed} failed"
+    else:
+        summary = f"All {total} sent for today"
+    return dots_html, summary
+
+
 def fired_histogram_html(state: dict, config: dict, days: int = 7) -> str:
     """Tiny bar chart of fired-count per day for the last N days."""
     tz = ZoneInfo(config.get("schedule", {}).get("timezone", "UTC"))
@@ -312,6 +357,15 @@ tr.next-up td:first-child::before {
 .progress-bar { height: 6px; background: var(--bg); border-radius: 3px; overflow: hidden; border: 1px solid var(--border); }
 .progress-bar .fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width 0.3s; }
 .progress-bar .fill.full { background: linear-gradient(90deg, var(--ok), #4ade80); }
+
+/* Today's progress dots on dashboard cards */
+.day-dots { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; margin-top: 4px; }
+.day-dot { width: 11px; height: 11px; border-radius: 50%; box-sizing: border-box; transition: transform 0.15s; }
+.day-dot.posted { background: var(--ok); box-shadow: 0 0 0 1px rgba(52,211,153,0.30); }
+.day-dot.fired  { background: var(--accent); box-shadow: 0 0 0 1px rgba(122,162,255,0.30); }
+.day-dot.queued { background: transparent; border: 2px solid var(--accent); }
+.day-dot.failed { background: var(--err); }
+.day-dot:hover { transform: scale(1.4); }
 
 /* Mini histogram for last-7-days fired */
 .histo { display: flex; align-items: flex-end; gap: 3px; height: 28px; margin-top: 6px; }
@@ -672,6 +726,14 @@ def dashboard():
             last_posted_html = '<div class="muted-2" style="margin-top:6px;">Last posted: <em>never</em></div>'
 
         histo_html = fired_histogram_html(state_full, config_full)
+        today_dots, today_summary = todays_progress_html(state_full, config_full)
+        today_block = (
+            f'<div class="muted-2" style="margin-top:14px;">Today</div>'
+            f'<div class="day-dots">{today_dots}</div>'
+            f'<div class="muted-2" style="margin-top:4px;">{html_escape(today_summary)}</div>'
+            if today_dots else
+            f'<div class="muted-2" style="margin-top:14px;">Today · <span style="color:var(--text-3);">{html_escape(today_summary)}</span></div>'
+        )
 
         cards_html += f"""
         <a class="card-link" href="/channel/{c['name']}"><div class="card" data-channel="{c['name']}">
@@ -679,6 +741,7 @@ def dashboard():
             <span class="health-pill {health_cls}">{html_escape(health_lbl)}</span>
           </div>
           <div class="muted-2" style="margin-top:4px;">{html_escape(c['integration'])} · {html_escape(c['times'])}</div>
+          {today_block}
           <div class="card-row" style="margin-top:14px;">
             <span class="stat"><strong data-stat="queued">{c['queued']}</strong> queued</span>
             <span class="stat"><strong data-stat="fired">{c['fired']}</strong> fired</span>
