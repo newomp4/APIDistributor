@@ -33,6 +33,7 @@ import os
 import random
 import re
 import shutil
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -202,6 +203,90 @@ def fetch_post_results(s: Settings, post_id: str) -> list[dict]:
         return payload.get("data", []) if isinstance(payload, dict) else (payload or [])
     except requests.RequestException:
         return []
+
+
+def trigger_analytics_sync(s: Settings, platform: str = "youtube") -> bool:
+    """Ask Post Bridge to refresh analytics from the platforms. Rate-limited
+    on their side; returns False on 429 so the caller can back off."""
+    try:
+        r = requests.post(
+            f"{s.api_url}/analytics/sync",
+            headers=auth_headers(s),
+            params={"platform": platform},
+            timeout=30,
+        )
+        if r.status_code == 429:
+            return False
+        return r.ok
+    except requests.RequestException as e:
+        log.warning("analytics sync error: %s", e)
+        return False
+
+
+def fetch_analytics_for_results(
+    s: Settings, result_ids: list[str],
+) -> dict[str, dict]:
+    """Returns {post_result_id: analytics_dto} for the given results."""
+    if not result_ids:
+        return {}
+    out: dict[str, dict] = {}
+    BATCH = 50
+    for i in range(0, len(result_ids), BATCH):
+        batch = result_ids[i:i + BATCH]
+        params: list[tuple[str, str]] = [("post_result_id", rid) for rid in batch]
+        params += [("limit", "100"), ("timeframe", "all")]
+        try:
+            r = requests.get(
+                f"{s.api_url}/analytics",
+                headers=auth_headers(s),
+                params=params,
+                timeout=15,
+            )
+            r.raise_for_status()
+            for item in r.json().get("data", []):
+                out[item["post_result_id"]] = item
+        except requests.RequestException as e:
+            log.warning("fetch analytics failed: %s", e)
+    return out
+
+
+def refresh_channel_analytics(
+    s: Settings, state: dict, channel_name: str,
+    do_sync: bool = False,
+) -> int:
+    """Pull latest analytics from Post Bridge for every published video in
+    this channel and save into v["analytics"]. Returns count updated.
+
+    Pass do_sync=True to also trigger a server-side refresh first (subject
+    to PB rate limits)."""
+    if do_sync:
+        if not trigger_analytics_sync(s):
+            log.info("[%s] analytics sync rate-limited, using cached", channel_name)
+        else:
+            time.sleep(2)  # let the sync settle
+    needs = [
+        v for v in state["videos"]
+        if v.get("result_id") and v.get("published_url")
+    ]
+    if not needs:
+        return 0
+    result_ids = [v["result_id"] for v in needs]
+    fresh = fetch_analytics_for_results(s, result_ids)
+    updated = 0
+    for v in needs:
+        rid = v.get("result_id")
+        if rid and rid in fresh:
+            a = fresh[rid]
+            v["analytics"] = {
+                "view_count": int(a.get("view_count") or 0),
+                "like_count": int(a.get("like_count") or 0),
+                "comment_count": int(a.get("comment_count") or 0),
+                "share_count": int(a.get("share_count") or 0),
+                "duration": a.get("duration"),
+                "last_synced_at": a.get("last_synced_at"),
+            }
+            updated += 1
+    return updated
 
 
 # -------------------- State file --------------------
@@ -646,6 +731,42 @@ def load_sidecar(video: Path) -> dict | None:
         return None
 
 
+def extract_thumbnail(video_path: Path, offset_seconds: float = 2.0) -> Path | None:
+    """Extract a still frame from the video using ffmpeg. Saves as
+    <video>.thumb.jpg next to the original. Returns the thumbnail path,
+    or None if ffmpeg isn't installed or extraction fails.
+
+    NOTE: Post Bridge's API doesn't accept custom thumbnails (their
+    YoutubeConfiguration only exposes title/caption/media), so this is
+    used only for local preview in the UI. You can manually set the
+    thumbnail in YouTube Studio after publish if you want."""
+    target = video_path.with_suffix(video_path.suffix + ".thumb.jpg")
+    if target.exists():
+        return target
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-ss", str(offset_seconds),
+                "-i", str(video_path),
+                "-frames:v", "1",
+                "-q:v", "3",
+                "-vf", "scale=480:-2",
+                str(target),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=15,
+        )
+        return target if target.exists() else None
+    except FileNotFoundError:
+        log.debug("ffmpeg not installed, skipping thumbnail")
+        return None
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        log.warning("thumbnail extract failed for %s: %s", video_path.name, e)
+        return None
+
+
 def find_videos(folder: Path) -> list[Path]:
     if not folder.exists():
         return []
@@ -925,6 +1046,11 @@ def discover_and_register(
         else:
             local_path = str(video)
 
+        # Extract a preview thumbnail (best-effort; only useful for UI preview
+        # since Post Bridge's API can't set custom YT thumbnails).
+        thumb = extract_thumbnail(Path(local_path))
+        thumb_path = str(thumb) if thumb else None
+
         log.info("[%s] registered %s -> slot %s",
                  channel_name, video.name, slot.isoformat())
 
@@ -938,6 +1064,7 @@ def discover_and_register(
             "fired": False,
             "media": None,
             "local_path": local_path,
+            "thumbnail_path": thumb_path,
             "post_id": None,
             "fired_at": None,
         })
@@ -1199,6 +1326,29 @@ def process_channel(
 
     # 5. Once PB confirms YouTube success, capture URL + clean up local file.
     if cleanup_published(s, state, config, channel_dir, channel_dir.name):
+        save_state(channel_dir, state)
+
+    # 6. Pull fresh analytics every ~30 min (with a server-side sync trigger
+    #    every ~60 min so platform numbers stay current).
+    last_sync_iso = state.get("last_analytics_sync_at")
+    last_full_iso = state.get("last_analytics_full_sync_at")
+    def _minutes_since(iso: str | None) -> float:
+        if not iso:
+            return 1e9
+        try:
+            dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+            return (datetime.now(timezone.utc) - dt).total_seconds() / 60
+        except Exception:
+            return 1e9
+    if _minutes_since(last_sync_iso) > 30:
+        do_full = _minutes_since(last_full_iso) > 60
+        n = refresh_channel_analytics(s, state, channel_dir.name, do_sync=do_full)
+        now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        state["last_analytics_sync_at"] = now_iso
+        if do_full:
+            state["last_analytics_full_sync_at"] = now_iso
+        if n:
+            log.info("[%s] refreshed analytics for %d posts", channel_dir.name, n)
         save_state(channel_dir, state)
 
 

@@ -835,6 +835,7 @@ def channel_detail(name: str):
       <span class="pill {pill_overdue}"><span class="dot"></span>{stats['overdue']} overdue</span>
       <span style="margin-left:14px;" class="muted">Next: <strong>{stats['next_slot'] or '—'}</strong></span>
       <span class="nav-spacer"></span>
+      <a class="btn ghost" href="/channel/{name}/performance">📊 Performance</a>
       <a class="btn ghost" href="/channel/{name}/calendar">📅 Calendar</a>
       <a class="btn ghost" href="/channel/{name}/variants">Variants ({variants_summary})</a>
     </div>
@@ -1126,6 +1127,202 @@ def fire_now(name: str, idx: int):
             flash_msg = f"Firing now · backfilled with '{moved.get('title','?')[:40]}'"
     write_state(channel_dir, state)
     return redirect(url_for("channel_detail", name=name, flash=flash_msg))
+
+
+@app.route("/channel/<name>/performance")
+def channel_performance(name: str):
+    if not safe_name(name):
+        abort(400)
+    channel_dir, config, state = load_channel(name)
+    tz = ZoneInfo(config.get("schedule", {}).get("timezone", "UTC"))
+
+    published = [v for v in state.get("videos", []) if v.get("published_url")]
+    with_stats = [v for v in published if v.get("analytics", {}).get("view_count") is not None]
+
+    total_views = sum(v.get("analytics", {}).get("view_count", 0) for v in with_stats)
+    total_likes = sum(v.get("analytics", {}).get("like_count", 0) for v in with_stats)
+    total_comments = sum(v.get("analytics", {}).get("comment_count", 0) for v in with_stats)
+    avg_views = (total_views / len(with_stats)) if with_stats else 0
+
+    last_sync = state.get("last_analytics_sync_at")
+    last_sync_ms = 0
+    if last_sync:
+        try:
+            last_sync_ms = int(datetime.fromisoformat(last_sync.replace("Z", "+00:00")).timestamp() * 1000)
+        except Exception:
+            pass
+
+    sort_by = request.args.get("sort", "views")
+    metric_key = {
+        "views": "view_count", "likes": "like_count",
+        "comments": "comment_count", "shares": "share_count",
+    }.get(sort_by, "view_count")
+
+    sorted_posts = sorted(
+        with_stats,
+        key=lambda v: v.get("analytics", {}).get(metric_key, 0),
+        reverse=True,
+    )
+
+    rows_top = ""
+    for rank, v in enumerate(sorted_posts[:25], 1):
+        a = v.get("analytics", {})
+        try:
+            fired_dt = datetime.fromisoformat((v.get("fired_at") or v["scheduled_for"]).replace("Z", "+00:00")).astimezone(tz)
+            fired_str = fired_dt.strftime("%b %-d · %-I:%M %p")
+        except Exception:
+            fired_str = "?"
+        url = v.get("published_url") or "#"
+        rows_top += (
+            f'<tr><td class="muted-2">{rank}</td>'
+            f'<td><a href="{html_escape(url)}" target="_blank" rel="noopener">{html_escape(v.get("title", v["filename"])[:80])}</a></td>'
+            f'<td>{a.get("view_count", 0):,}</td>'
+            f'<td>{a.get("like_count", 0):,}</td>'
+            f'<td>{a.get("comment_count", 0):,}</td>'
+            f'<td>{a.get("share_count", 0):,}</td>'
+            f'<td class="muted-2">{fired_str}</td></tr>'
+        )
+
+    # ---- Variant A/B aggregation ----
+    yt = config.get("youtube", {})
+    desc_variants = yt.get("description_variants") or []
+    pinned_variants = yt.get("pinned_message_variants") or []
+
+    def variant_breakdown(key: str, choices: list[str]) -> list[dict]:
+        groups: dict[int, list[int]] = {}
+        for v in with_stats:
+            idx = (v.get("variants_used") or {}).get(key)
+            if idx is None:
+                continue
+            groups.setdefault(int(idx), []).append(v.get("analytics", {}).get("view_count", 0))
+        out = []
+        for idx, views_list in groups.items():
+            n = len(views_list)
+            avg = sum(views_list) / n
+            label = (choices[idx][:80] + "…") if 0 <= idx < len(choices) and len(choices[idx]) > 80 else (choices[idx] if 0 <= idx < len(choices) else f"index {idx}")
+            out.append({"idx": idx, "label": label, "n": n, "avg": avg, "total": sum(views_list)})
+        out.sort(key=lambda r: r["avg"], reverse=True)
+        return out
+
+    desc_rows = variant_breakdown("description_variant_index", desc_variants)
+    pinned_rows = variant_breakdown("pinned_variant_index", pinned_variants)
+
+    def render_variant_table(name: str, rows: list[dict]) -> str:
+        if not rows:
+            return f'<div class="muted-2">No A/B data yet for {name}. Need at least 2 posts using different variants with view stats.</div>'
+        max_avg = max((r["avg"] for r in rows), default=1) or 1
+        out = f'<table><thead><tr><th>Rank</th><th>{name}</th><th>n</th><th>Avg views</th><th>Total</th><th></th></tr></thead><tbody>'
+        for rank, r in enumerate(rows, 1):
+            bar_pct = (r["avg"] / max_avg) * 100
+            badge = (
+                '<span class="pill ok" style="margin-left:6px;">★ winner</span>' if rank == 1 and len(rows) > 1
+                else ('<span class="pill warn" style="margin-left:6px;">underperformer</span>' if rank == len(rows) and len(rows) > 1 else '')
+            )
+            out += (
+                f'<tr><td class="muted-2">#{rank}</td>'
+                f'<td><span class="muted-2 mono">#{r["idx"]}</span> {html_escape(r["label"])}{badge}</td>'
+                f'<td>{r["n"]}</td><td><strong>{r["avg"]:,.0f}</strong></td><td>{r["total"]:,}</td>'
+                f'<td><div class="progress-bar" style="width:120px;"><div class="fill" style="width:{bar_pct:.0f}%;"></div></div></td>'
+                '</tr>'
+            )
+        out += '</tbody></table>'
+        return out
+
+    # ---- Best time aggregation ----
+    hour_buckets: dict[int, list[int]] = {h: [] for h in range(24)}
+    for v in with_stats:
+        try:
+            dt = datetime.fromisoformat((v.get("fired_at") or v["scheduled_for"]).replace("Z", "+00:00")).astimezone(tz)
+        except Exception:
+            continue
+        hour_buckets[dt.hour].append(v.get("analytics", {}).get("view_count", 0))
+    hour_avgs = {h: (sum(v) / len(v) if v else 0) for h, v in hour_buckets.items()}
+    max_hour_avg = max(hour_avgs.values()) or 1
+
+    hours_html = ""
+    for h in range(24):
+        v = hour_avgs[h]
+        n = len(hour_buckets[h])
+        if n == 0:
+            bar_class, height = "", 4
+        else:
+            bar_class = "has"
+            height = max(8, int((v / max_hour_avg) * 100))
+        hours_html += (
+            f'<div class="hour-col" title="{h:02d}:00 — {n} posts, avg {v:,.0f} views">'
+            f'<div class="bar {bar_class}" style="height:{height}%;"></div>'
+            f'<div class="hour-label">{h:02d}</div></div>'
+        )
+    best_hours = sorted(hour_avgs.items(), key=lambda kv: kv[1], reverse=True)
+    best_hours_with_data = [(h, avg) for h, avg in best_hours if len(hour_buckets[h]) > 0][:3]
+
+    best_hours_summary = (
+        " · ".join(f"<strong>{h:02d}:00</strong> ({avg:,.0f})" for h, avg in best_hours_with_data)
+        if best_hours_with_data else "Need more data"
+    )
+
+    perf_styles = """
+    <style>
+      .hour-grid { display: flex; align-items: flex-end; gap: 4px; height: 110px; padding: 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; }
+      .hour-col { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; }
+      .hour-col .bar { width: 100%; background: var(--bg-3); border-radius: 2px 2px 0 0; min-height: 4px; transition: background 0.2s; }
+      .hour-col .bar.has { background: var(--accent); }
+      .hour-col .hour-label { font-size: 9px; color: var(--text-3); margin-top: 4px; font-family: ui-monospace, monospace; }
+    </style>
+    """
+
+    body = f"""
+    {perf_styles}
+    <a href="/channel/{name}" class="muted">← {html_escape(name)}</a>
+    <div class="row spread" style="margin-top:10px; align-items:center;">
+      <h1 style="margin:0;">Performance</h1>
+      <form method="post" action="/channel/{name}/performance/sync" style="margin:0;">
+        <button class="subtle" type="submit" title="Pull fresh stats from Post Bridge (rate-limited on their side)">↻ Sync now</button>
+      </form>
+    </div>
+    <p class="subhead">{len(with_stats)} of {len(published)} published videos have analytics{f' · last sync <span data-when="{last_sync_ms}">…</span>' if last_sync_ms else ''}</p>
+
+    <div class="grid" style="grid-template-columns: repeat(auto-fill, minmax(180px,1fr)); margin-bottom:24px;">
+      <div class="card"><div class="muted-2">Total views</div><h2 style="margin:6px 0 0; font-size:24px;">{total_views:,}</h2></div>
+      <div class="card"><div class="muted-2">Total likes</div><h2 style="margin:6px 0 0; font-size:24px;">{total_likes:,}</h2></div>
+      <div class="card"><div class="muted-2">Total comments</div><h2 style="margin:6px 0 0; font-size:24px;">{total_comments:,}</h2></div>
+      <div class="card"><div class="muted-2">Avg views / post</div><h2 style="margin:6px 0 0; font-size:24px;">{avg_views:,.0f}</h2></div>
+    </div>
+
+    <h2>Top performers</h2>
+    <div class="row" style="margin-bottom:8px;">
+      <a class="btn tiny ghost{(' active' if sort_by=='views' else '')}" href="?sort=views">By views</a>
+      <a class="btn tiny ghost{(' active' if sort_by=='likes' else '')}" href="?sort=likes">By likes</a>
+      <a class="btn tiny ghost{(' active' if sort_by=='comments' else '')}" href="?sort=comments">By comments</a>
+      <a class="btn tiny ghost{(' active' if sort_by=='shares' else '')}" href="?sort=shares">By shares</a>
+    </div>
+    {f'<table><thead><tr><th>#</th><th>Title</th><th>Views</th><th>Likes</th><th>Comments</th><th>Shares</th><th>Posted</th></tr></thead><tbody>{rows_top}</tbody></table>' if rows_top else '<div class="empty">No analytics yet. Click <strong>Sync now</strong> above (Post Bridge usually takes a few hours after publish to surface the first numbers).</div>'}
+
+    <h2 style="margin-top:32px;">A/B test — Description variants</h2>
+    {render_variant_table('Description', desc_rows)}
+
+    <h2 style="margin-top:24px;">A/B test — Pinned message variants</h2>
+    {render_variant_table('Pinned message', pinned_rows)}
+
+    <h2 style="margin-top:32px;">Best posting times</h2>
+    <p class="subhead">Top hours by average views: {best_hours_summary}</p>
+    <div class="hour-grid">{hours_html}</div>
+    """
+    return render(f"{name} — Performance", body, active_channel=name)
+
+
+@app.route("/channel/<name>/performance/sync", methods=["POST"])
+def performance_sync(name: str):
+    if not safe_name(name):
+        abort(400)
+    channel_dir, _, state = load_channel(name)
+    s = watcher_lib.load_settings()
+    n = watcher_lib.refresh_channel_analytics(s, state, name, do_sync=True)
+    state["last_analytics_sync_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    state["last_analytics_full_sync_at"] = state["last_analytics_sync_at"]
+    write_state(channel_dir, state)
+    msg = f"Synced · {n} post{'s' if n != 1 else ''} updated"
+    return redirect(url_for("channel_performance", name=name, flash=msg))
 
 
 @app.route("/channel/<name>/calendar")
