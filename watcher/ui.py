@@ -288,7 +288,8 @@ tr.next-up td:first-child::before {
 .today-strip .slot-marker.failed   { background: var(--err); }
 
 /* Health badges */
-.health-pill { display:inline-flex; align-items:center; gap:6px; font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 999px; }
+.health-pill { display:inline-flex; align-items:center; gap:6px; font-size: 11px; font-weight: 600; padding: 4px 10px; border-radius: 999px; letter-spacing: 0.01em; }
+.health-pill::before { content:""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .health-pill.healthy { background: rgba(52,211,153,0.10); color: var(--ok); border: 1px solid rgba(52,211,153,0.25); }
 .health-pill.attention { background: rgba(251,191,36,0.10); color: var(--warn); border: 1px solid rgba(251,191,36,0.30); }
 .health-pill.problem { background: rgba(248,113,113,0.10); color: var(--err); border: 1px solid rgba(248,113,113,0.30); }
@@ -357,13 +358,16 @@ h3 { font-size: 15px; font-weight: 600; margin: 0; }
 .muted-2 { color: var(--text-3); font-size: 12px; }
 .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
 
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: var(--space-4); }
 .card {
-  background: var(--bg-2); border: 1px solid var(--border); border-radius: 10px;
-  padding: 18px; transition: border-color 0.15s;
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 18px; transition: border-color var(--transition), transform var(--transition), box-shadow var(--transition);
+  box-shadow: var(--shadow-1);
 }
 .card:hover { border-color: var(--border-strong); }
 .card-link { color: inherit; text-decoration: none; display:block; }
+.card-link:hover { text-decoration: none; }
+.card-link:hover .card { transform: translateY(-1px); box-shadow: var(--shadow-2); border-color: var(--border-strong); }
 .card-row { display: flex; align-items: center; gap: 10px; }
 .card-row + .card-row { margin-top: 8px; }
 
@@ -393,17 +397,21 @@ form input:focus, form select:focus, form textarea:focus { outline: none; border
 form textarea { min-height: 90px; font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.5; }
 .btn, button {
   padding: 8px 14px; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 13px;
-  border: 1px solid transparent; transition: background 0.15s, border-color 0.15s, color 0.15s;
+  border: 1px solid transparent;
+  transition: background var(--transition), border-color var(--transition), color var(--transition), transform 0.06s ease;
   background: var(--accent); color: #0a0b0f; font-family: inherit;
 }
 .btn:hover, button:hover { background: #93b6ff; }
+.btn:active, button:active { transform: scale(0.98); }
 .btn.subtle, button.subtle { background: var(--bg-3); color: var(--text); border-color: var(--border); }
 .btn.subtle:hover, button.subtle:hover { background: #232737; border-color: var(--border-strong); }
 .btn.ghost, button.ghost { background: transparent; color: var(--text-2); border-color: var(--border); }
 .btn.ghost:hover, button.ghost:hover { color: var(--text); border-color: var(--border-strong); background: var(--bg-2); }
+.btn.ghost.active, .btn.tiny.ghost.active { color: var(--text); background: var(--bg-3); border-color: var(--border-strong); }
 .btn.danger, button.danger { background: rgba(248,113,113,0.10); color: var(--err); border: 1px solid rgba(248,113,113,0.30); }
 .btn.danger:hover, button.danger:hover { background: rgba(248,113,113,0.20); }
 .btn.tiny, button.tiny { padding: 4px 9px; font-size: 12px; font-weight: 500; }
+.btn:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .row.spread { justify-content: space-between; }
@@ -420,11 +428,28 @@ code { background: var(--bg-3); padding: 1px 6px; border-radius: 4px; font-size:
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
 
-.empty { padding: 36px 20px; text-align: center; color: var(--text-2); border: 1px dashed var(--border); border-radius: 10px; background: var(--bg-2); }
-.empty h3 { color: var(--text); margin-bottom: 6px; }
+.empty { padding: 48px 20px; text-align: center; color: var(--text-2); border: 1px dashed var(--border); border-radius: var(--radius); background: var(--bg-2); }
+.empty h3 { color: var(--text); margin-bottom: 6px; font-size: 16px; }
+.empty .icon { font-size: 32px; opacity: 0.5; display: block; margin-bottom: 12px; }
 
-.toast { position: fixed; right: 20px; bottom: 20px; padding: 10px 14px; background: var(--bg-3); border: 1px solid var(--border-strong); border-radius: 8px; box-shadow: var(--shadow); display:none; }
-.toast.show { display: block; }
+footer.site-footer { padding: 32px 24px 24px; max-width: 1200px; margin: 0 auto; border-top: 1px solid var(--border); margin-top: 64px; display: flex; gap: 24px; align-items: center; flex-wrap: wrap; color: var(--text-3); font-size: 12px; }
+footer.site-footer .nav-spacer { flex: 1; }
+footer.site-footer a { color: var(--text-2); }
+footer.site-footer a:hover { color: var(--text); }
+
+/* Slightly tighter input padding on number inputs */
+form input[type=number] { font-variant-numeric: tabular-nums; }
+form select { appearance: none; background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='%239ba1b0'><path d='M4 6l4 4 4-4'/></svg>"); background-repeat: no-repeat; background-position: right 10px center; padding-right: 32px; }
+
+table { font-variant-numeric: tabular-nums; }
+
+/* When a section is heavy (raw YAML editor), let it collapse */
+details.advanced > summary { padding: 10px 12px; background: var(--bg-2); border: 1px solid var(--border); border-radius: 8px; }
+details.advanced > div { margin-top: 8px; padding: 0; background: transparent; border: 0; }
+
+/* Page enter animation — very subtle */
+main.container > h1 { animation: fadeIn 0.25s ease; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
 """
 
 JS = """
@@ -527,6 +552,11 @@ BASE = """
 <main class="container">
 {{ body|safe }}
 </main>
+<footer class="site-footer">
+  <span>APIDistributor · folder-driven YouTube distribution</span>
+  <span class="nav-spacer"></span>
+  <a href="https://github.com/newomp4/APIDistributor" target="_blank" rel="noopener">github.com/newomp4/APIDistributor</a>
+</footer>
 <script>{{ js|safe }}</script>
 </body></html>
 """
@@ -620,8 +650,10 @@ def dashboard():
     if not cards:
         cards_html = """
         <div class="empty">
+          <span class="icon">📡</span>
           <h3>No channels yet</h3>
-          <div>Click <a href="/add">+ Add</a> to wire up your first channel.</div>
+          <div>Wire up your first channel to start distributing.</div>
+          <div style="margin-top:14px;"><a class="btn" href="/add">+ Add channel</a></div>
         </div>"""
 
     pb_status_html = (
@@ -761,7 +793,7 @@ def channel_detail(name: str):
     table_html = (
         f'<table><thead><tr><th>Video</th><th>Slot</th><th>Status</th><th></th></tr></thead><tbody>{rows_html}</tbody></table>'
         if rows_html else
-        '<div class="empty"><h3>No videos here</h3><div>Drop one in the source folder and the watcher will pick it up within 30s.</div></div>'
+        '<div class="empty"><span class="icon">📭</span><h3>Nothing here yet</h3><div>Drop a video into the source folder — the watcher picks it up within 30s.</div></div>'
     )
 
     desc_count = len(yt.get("description_variants") or [])
@@ -898,17 +930,21 @@ def channel_detail(name: str):
     </div>
     {table_html}
 
-    <h2>Edit raw config.yaml</h2>
-    <form method="post" action="/channel/{name}/config">
-      <textarea name="config_yaml" rows="18">{html_escape(yaml.safe_dump(config, sort_keys=False, default_flow_style=False, allow_unicode=True))}</textarea>
-      <div class="row" style="margin-top:10px;">
-        <button type="submit">Save config</button>
-        <span class="nav-spacer"></span>
-        <form method="post" action="/channel/{name}/delete" onsubmit="return confirm('Archive this channel folder? Videos in posted/ stay on disk; the folder moves to .deleted_channels/.');" style="margin:0;">
-          <button class="danger" type="submit">Delete channel folder</button>
+    <details class="advanced" style="margin-top:32px;">
+      <summary><span class="muted">Advanced — </span>Edit raw config.yaml</summary>
+      <div>
+        <form method="post" action="/channel/{name}/config" style="margin-top:12px;">
+          <textarea name="config_yaml" rows="18">{html_escape(yaml.safe_dump(config, sort_keys=False, default_flow_style=False, allow_unicode=True))}</textarea>
+          <div class="row" style="margin-top:10px;">
+            <button type="submit">Save config</button>
+            <span class="nav-spacer"></span>
+            <form method="post" action="/channel/{name}/delete" onsubmit="return confirm('Archive this channel folder? Videos in posted/ stay on disk; the folder moves to .deleted_channels/.');" style="margin:0;">
+              <button class="danger" type="submit">Delete channel folder</button>
+            </form>
+          </div>
         </form>
       </div>
-    </form>
+    </details>
     """
     return render(name, body, active_channel=name)
 

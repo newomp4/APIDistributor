@@ -33,7 +33,6 @@ import os
 import random
 import re
 import shutil
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -731,42 +730,6 @@ def load_sidecar(video: Path) -> dict | None:
         return None
 
 
-def extract_thumbnail(video_path: Path, offset_seconds: float = 2.0) -> Path | None:
-    """Extract a still frame from the video using ffmpeg. Saves as
-    <video>.thumb.jpg next to the original. Returns the thumbnail path,
-    or None if ffmpeg isn't installed or extraction fails.
-
-    NOTE: Post Bridge's API doesn't accept custom thumbnails (their
-    YoutubeConfiguration only exposes title/caption/media), so this is
-    used only for local preview in the UI. You can manually set the
-    thumbnail in YouTube Studio after publish if you want."""
-    target = video_path.with_suffix(video_path.suffix + ".thumb.jpg")
-    if target.exists():
-        return target
-    try:
-        result = subprocess.run(
-            [
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-ss", str(offset_seconds),
-                "-i", str(video_path),
-                "-frames:v", "1",
-                "-q:v", "3",
-                "-vf", "scale=480:-2",
-                str(target),
-            ],
-            check=True,
-            capture_output=True,
-            timeout=15,
-        )
-        return target if target.exists() else None
-    except FileNotFoundError:
-        log.debug("ffmpeg not installed, skipping thumbnail")
-        return None
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-        log.warning("thumbnail extract failed for %s: %s", video_path.name, e)
-        return None
-
-
 def find_videos(folder: Path) -> list[Path]:
     if not folder.exists():
         return []
@@ -1046,11 +1009,6 @@ def discover_and_register(
         else:
             local_path = str(video)
 
-        # Extract a preview thumbnail (best-effort; only useful for UI preview
-        # since Post Bridge's API can't set custom YT thumbnails).
-        thumb = extract_thumbnail(Path(local_path))
-        thumb_path = str(thumb) if thumb else None
-
         log.info("[%s] registered %s -> slot %s",
                  channel_name, video.name, slot.isoformat())
 
@@ -1064,7 +1022,6 @@ def discover_and_register(
             "fired": False,
             "media": None,
             "local_path": local_path,
-            "thumbnail_path": thumb_path,
             "post_id": None,
             "fired_at": None,
         })
