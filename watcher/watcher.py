@@ -379,6 +379,48 @@ def unschedule_video(s: Settings | None, video: dict) -> None:
         video.pop(k, None)
 
 
+def backfill_vacated_slot(
+    state: dict, vacated_iso: str, exclude_idx: int, s: Settings | None = None,
+) -> dict | None:
+    """When a video is fired-early or moved-earlier, the slot it vacated
+    becomes empty. Pull the LATEST-scheduled unfired video into that slot
+    so daily volume stays the same and only two videos move (the one fired
+    and the one moved up). Returns the moved video or None if no candidate.
+
+    Only acts if the vacated slot is in the future and is genuinely earlier
+    than the latest queued slot (otherwise we'd be moving a video later,
+    which makes no sense for "fire now")."""
+    try:
+        vacated_dt = datetime.fromisoformat(vacated_iso.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+    if vacated_dt <= datetime.now(timezone.utc) + timedelta(minutes=2):
+        return None  # already past — no point backfilling
+
+    latest_idx = -1
+    latest_dt = None
+    for i, v in enumerate(state["videos"]):
+        if i == exclude_idx:
+            continue
+        if v.get("fired") or v.get("published_url"):
+            continue
+        try:
+            dt = datetime.fromisoformat(v["scheduled_for"].replace("Z", "+00:00"))
+        except (KeyError, ValueError):
+            continue
+        if latest_dt is None or dt > latest_dt:
+            latest_dt = dt
+            latest_idx = i
+
+    if latest_idx < 0 or latest_dt is None or latest_dt <= vacated_dt:
+        return None  # no later video to move up
+
+    moved = state["videos"][latest_idx]
+    unschedule_video(s, moved)
+    moved["scheduled_for"] = vacated_iso
+    return moved
+
+
 def reschedule_all_queued(state: dict, config: dict, s: Settings | None = None) -> int:
     """Repack every unfired video onto the current schedule, starting from now.
     Preserves the original order (by previous scheduled_for). Used when the

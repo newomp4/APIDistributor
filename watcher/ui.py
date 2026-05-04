@@ -97,6 +97,7 @@ def channel_stats(state: dict, config: dict) -> dict:
     now = datetime.now(tz)
     queued = [v for v in state.get("videos", []) if not v.get("fired")]
     fired = [v for v in state.get("videos", []) if v.get("fired")]
+    published = [v for v in state.get("videos", []) if v.get("published_url")]
     overdue = 0
     next_slot = None
     for v in queued:
@@ -108,11 +109,29 @@ def channel_stats(state: dict, config: dict) -> dict:
             overdue += 1
         elif next_slot is None or slot < next_slot:
             next_slot = slot
+
+    last_posted_at = None
+    last_posted_url = None
+    for v in fired:
+        ts = v.get("fired_at") or v.get("scheduled_for")
+        if not ts:
+            continue
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            continue
+        if last_posted_at is None or dt > last_posted_at:
+            last_posted_at = dt
+            last_posted_url = v.get("published_url")
+
     return {
         "queued": len(queued),
         "fired": len(fired),
+        "published": len(published),
         "overdue": overdue,
         "next_slot": next_slot.strftime("%a %b %d · %-I:%M %p") if next_slot else None,
+        "last_posted_iso": (last_posted_at.isoformat() if last_posted_at else None),
+        "last_posted_url": last_posted_url,
     }
 
 
@@ -136,6 +155,16 @@ def html_escape(s) -> str:
 
 
 CSS = """
+.slot-dot { display:inline-block; width:10px; height:10px; border-radius:50%; }
+.slot-dot.active { background: var(--accent); box-shadow: 0 0 0 1px rgba(122,162,255,0.30); }
+.slot-dot.inactive { background: transparent; border: 1px solid var(--border-strong); }
+tr.next-up td { background: rgba(122,162,255,0.06); border-left: 2px solid var(--accent); }
+tr.next-up td:first-child::before {
+  content: "▶ NEXT UP"; display: inline-block; font-size: 9px; font-weight: 700;
+  letter-spacing: 0.08em; color: var(--accent); background: rgba(122,162,255,0.15);
+  padding: 2px 6px; border-radius: 4px; margin-right: 8px; vertical-align: 2px;
+}
+
 :root {
   --bg: #0a0b0f;
   --bg-2: #14161d;
@@ -397,10 +426,26 @@ def dashboard():
             **stats,
         })
 
-    integ_count = len(fetch_integrations())
+    integrations = fetch_integrations()
+    integ_count = len(integrations)
+    pb_ok = integ_count > 0
     cards_html = ""
     for c in cards:
         pill_class = "ok" if c["overdue"] == 0 else "warn"
+        last_posted_html = ""
+        if c.get("last_posted_iso"):
+            try:
+                ts_ms = int(datetime.fromisoformat(c["last_posted_iso"]).timestamp() * 1000)
+                last_posted_html = (
+                    f'<div class="muted-2" style="margin-top:6px;">'
+                    f'Last posted: <span data-when="{ts_ms}">…</span>'
+                    f'</div>'
+                )
+            except Exception:
+                pass
+        else:
+            last_posted_html = '<div class="muted-2" style="margin-top:6px;">Last posted: <em>never</em></div>'
+
         cards_html += f"""
         <a class="card-link" href="/channel/{c['name']}"><div class="card" data-channel="{c['name']}">
           <div class="card-row spread"><h3>{html_escape(c['name'])}</h3>
@@ -412,6 +457,7 @@ def dashboard():
             <span class="stat"><strong data-stat="fired">{c['fired']}</strong> fired</span>
           </div>
           <div class="muted-2" style="margin-top:10px;">Next: <span data-stat="next">{html_escape(c['next_slot'] or '— nothing queued —')}</span></div>
+          {last_posted_html}
         </div></a>
         """
 
@@ -422,9 +468,14 @@ def dashboard():
           <div>Click <a href="/add">+ Add</a> to wire up your first channel.</div>
         </div>"""
 
+    pb_status_html = (
+        f'<span class="pill ok" style="margin-right:8px;"><span class="dot"></span>Post Bridge connected · {integ_count} accounts</span>'
+        if pb_ok else
+        '<span class="pill err" style="margin-right:8px;"><span class="dot"></span>Post Bridge unreachable — check your API key</span>'
+    )
     body = f"""
     <h1>Channels</h1>
-    <p class="subhead">{integ_count} {'account' if integ_count == 1 else 'accounts'} connected in Post Bridge · auto-refresh every 5s</p>
+    <p class="subhead">{pb_status_html}auto-refresh every 5s</p>
     <div class="grid">{cards_html}</div>
     """
     return render("Channels", body, active="dashboard")
@@ -451,6 +502,20 @@ def channel_detail(name: str):
         indexed = [(i, v) for i, v in indexed if not v.get("fired")]
     elif filt == "fired":
         indexed = [(i, v) for i, v in indexed if v.get("fired")]
+
+    # Identify the "next up" video — earliest unfired with a future slot.
+    now_utc = datetime.now(timezone.utc)
+    next_up_idx = None
+    for orig_idx, v in indexed:
+        if v.get("fired") or v.get("published_url"):
+            continue
+        try:
+            slot_dt = datetime.fromisoformat(v["scheduled_for"].replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if slot_dt > now_utc:
+            next_up_idx = orig_idx
+            break
 
     rows_html = ""
     for orig_idx, v in indexed:
@@ -522,8 +587,10 @@ def channel_detail(name: str):
                 f'onsubmit="return confirm(\'Remove from queue? File in posted/ stays on disk; Post Bridge schedule is cancelled.\');" style="display:inline;">'
                 f'<button class="danger tiny" type="submit">Delete</button></form>'
             )
+        row_class = "next-up" if orig_idx == next_up_idx else ""
         rows_html += (
-            f'<tr data-video-row data-title="{html_escape(raw_title)}">'
+            f'<tr data-video-row data-title="{html_escape(raw_title)}"'
+            f'{f" class=\"{row_class}\"" if row_class else ""}>'
             f'<td>{title_html}</td>'
             f'<td>{slot_str}{rel_html}</td>'
             f'<td>{status_pill}</td>'
@@ -554,7 +621,17 @@ def channel_detail(name: str):
         age = watcher_lib.channel_age_days(state, today, tz)
         per_day = watcher_lib.per_day_for(config, age)
         total = len(sched.get("times", []))
-        warmup_html = f'<div><div class="muted-2">Warmup</div><div><strong>day {age} · {per_day}/{total} slots active today</strong></div></div>'
+        # Visual: filled circles for active slots, hollow for inactive
+        dots = ''.join(
+            '<span class="slot-dot active"></span>' if i < per_day
+            else '<span class="slot-dot inactive"></span>'
+            for i in range(total)
+        )
+        warmup_html = (
+            f'<div><div class="muted-2">Warmup · day {age}</div>'
+            f'<div style="margin-top:4px; display:flex; gap:5px; align-items:center;">'
+            f'{dots} <span class="muted-2" style="margin-left:6px;">{per_day}/{total}</span></div></div>'
+        )
     else:
         warmup_html = ''
 
@@ -811,10 +888,25 @@ def reschedule_video(name: str, idx: int):
     if not when or idx >= len(state.get("videos", [])):
         abort(400)
     s = watcher_lib.load_settings()
-    watcher_lib.unschedule_video(s, state["videos"][idx])
-    state["videos"][idx]["scheduled_for"] = when
+    target = state["videos"][idx]
+    old_slot = target.get("scheduled_for")
+    watcher_lib.unschedule_video(s, target)
+    target["scheduled_for"] = when
+
+    flash_msg = "Rescheduled"
+    if request.form.get("backfill", "1") == "1" and old_slot:
+        try:
+            new_dt = datetime.fromisoformat(when.replace("Z", "+00:00"))
+            old_dt = datetime.fromisoformat(old_slot.replace("Z", "+00:00"))
+            moved_earlier = new_dt < old_dt
+        except Exception:
+            moved_earlier = False
+        if moved_earlier:
+            moved = watcher_lib.backfill_vacated_slot(state, old_slot, idx, s)
+            if moved:
+                flash_msg = f"Rescheduled · backfilled with '{moved.get('title','?')[:40]}'"
     write_state(channel_dir, state)
-    return redirect(url_for("channel_detail", name=name, flash="Rescheduled"))
+    return redirect(url_for("channel_detail", name=name, flash=flash_msg))
 
 
 @app.route("/channel/<name>/video/<int:idx>/delete", methods=["POST"])
@@ -840,10 +932,20 @@ def fire_now(name: str, idx: int):
     if idx >= len(state.get("videos", [])):
         abort(400)
     s = watcher_lib.load_settings()
-    watcher_lib.unschedule_video(s, state["videos"][idx])
-    state["videos"][idx]["scheduled_for"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    target = state["videos"][idx]
+    original_slot = target.get("scheduled_for")
+    watcher_lib.unschedule_video(s, target)
+    target["scheduled_for"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    flash_msg = "Will fire on next watcher cycle"
+    # Backfill the vacated slot with the latest-scheduled video so daily
+    # cadence stays the same. Default ON; pass backfill=0 to leave a gap.
+    if request.form.get("backfill", "1") == "1" and original_slot:
+        moved = watcher_lib.backfill_vacated_slot(state, original_slot, idx, s)
+        if moved:
+            flash_msg = f"Firing now · backfilled with '{moved.get('title','?')[:40]}'"
     write_state(channel_dir, state)
-    return redirect(url_for("channel_detail", name=name, flash="Will fire on next watcher cycle"))
+    return redirect(url_for("channel_detail", name=name, flash=flash_msg))
 
 
 @app.route("/channel/<name>/calendar")
