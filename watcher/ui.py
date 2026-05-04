@@ -698,12 +698,18 @@ def channel_detail(name: str):
         <button type="submit" title="Pull queued videos forward to extra slots today">Pull videos to today</button>
       </form>
       <div class="divider"></div>
-      <form method="post" action="/channel/{name}/reschedule-all"
-            onsubmit="return confirm('Repack ALL queued videos onto the current schedule, starting from now? Useful after editing times/days in config. Already-published videos stay put.');"
-            style="display:inline;">
-        <button class="subtle" type="submit"
-                title="Re-distribute every queued video evenly across the current schedule, starting from now. Use after editing the times-per-day or days settings.">↻ Reschedule all queued</button>
-      </form>
+      <div class="row" style="gap:8px; flex-wrap:wrap;">
+        <form method="post" action="/channel/{name}/fill-today" style="display:inline;">
+          <button class="subtle" type="submit"
+                  title="For each empty slot today (per your schedule), pull the latest-scheduled queued video forward to fill it.">↑ Fill today's empty slots</button>
+        </form>
+        <form method="post" action="/channel/{name}/reschedule-all"
+              onsubmit="return confirm('Repack ALL queued videos onto the current schedule, starting from now? Useful after editing times/days in config. Already-published videos stay put.');"
+              style="display:inline;">
+          <button class="subtle" type="submit"
+                  title="Re-distribute every queued video evenly across the current schedule, starting from now. Use after editing the times-per-day or days settings.">↻ Reschedule all queued</button>
+        </form>
+      </div>
     </div>
 
     <div class="row spread" style="margin-top:28px; align-items:baseline;">
@@ -1048,6 +1054,25 @@ def reschedule_all(name: str):
     if n:
         write_state(channel_dir, state)
     return redirect(url_for("channel_detail", name=name, flash=f"Rescheduled {n} videos"))
+
+
+@app.route("/channel/<name>/fill-today", methods=["POST"])
+def fill_today(name: str):
+    """Pull queued videos forward to fill any empty slots today (per the
+    config's configured times). Useful when fire-now or deletes left holes
+    before the auto-backfill feature was added."""
+    if not safe_name(name):
+        abort(400)
+    channel_dir, config, state = load_channel(name)
+    s = watcher_lib.load_settings()
+    n = watcher_lib.fill_todays_remaining_slots(state, config, s)
+    if n:
+        write_state(channel_dir, state)
+    msg = (
+        f"Filled {n} empty slot{'s' if n != 1 else ''} today" if n
+        else "Today's slots are already full (or all past)"
+    )
+    return redirect(url_for("channel_detail", name=name, flash=msg))
 
 
 @app.route("/channel/<name>/bonus-today", methods=["POST"])

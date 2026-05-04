@@ -379,6 +379,83 @@ def unschedule_video(s: Settings | None, video: dict) -> None:
         video.pop(k, None)
 
 
+def fill_todays_remaining_slots(
+    state: dict, config: dict, s: Settings | None = None,
+) -> int:
+    """For each FUTURE slot today (per the config schedule) that doesn't have
+    a queued video assigned to it, pull the latest-scheduled queued video
+    forward to fill it. Doesn't touch slots that already have a video
+    (within a reasonable proximity), and doesn't pull videos that are
+    already scheduled for today."""
+    sched = config.get("schedule", {})
+    times = sched.get("times", [])
+    days_allowed = set(sched.get("days", DAY_NAMES))
+    tz = get_schedule_tz(config)
+    now = datetime.now(tz)
+    today = now.date()
+    if DAY_NAMES[today.weekday()] not in days_allowed:
+        return 0
+
+    # Future slots today, derived from the config's base times
+    future_today_slots: list[datetime] = []
+    for tstr in times:
+        try:
+            hh, mm = parse_time_of_day(tstr)
+        except (ValueError, AttributeError):
+            continue
+        slot = datetime(today.year, today.month, today.day, hh, mm, tzinfo=tz)
+        if slot > now + timedelta(minutes=2):
+            future_today_slots.append(slot)
+    if not future_today_slots:
+        return 0
+
+    # Pre-existing scheduled times for today (tolerate ± jitter for "is this slot taken")
+    try:
+        jitter = max(0, int(sched.get("jitter_minutes", 0)))
+    except (TypeError, ValueError):
+        jitter = 0
+    proximity_sec = max(60, jitter * 60)
+
+    used_today_dts: list[datetime] = []
+    for v in state["videos"]:
+        if v.get("published_url"):
+            continue
+        try:
+            dt = parse_iso(v["scheduled_for"], tz)
+        except (KeyError, ValueError):
+            continue
+        if dt.date() == today:
+            used_today_dts.append(dt)
+
+    filled = 0
+    for empty_slot in future_today_slots:
+        if any(abs((empty_slot - u).total_seconds()) < proximity_sec for u in used_today_dts):
+            continue
+        # Pick the latest queued video that's NOT scheduled for today already
+        latest_idx = -1
+        latest_dt = None
+        for i, v in enumerate(state["videos"]):
+            if v.get("fired") or v.get("published_url"):
+                continue
+            try:
+                dt = parse_iso(v["scheduled_for"], tz)
+            except (KeyError, ValueError):
+                continue
+            if dt.date() == today:
+                continue
+            if latest_dt is None or dt > latest_dt:
+                latest_dt = dt
+                latest_idx = i
+        if latest_idx < 0:
+            break  # no pull-forward candidates left
+        moved = state["videos"][latest_idx]
+        unschedule_video(s, moved)
+        moved["scheduled_for"] = empty_slot.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        used_today_dts.append(empty_slot)
+        filled += 1
+    return filled
+
+
 def backfill_vacated_slot(
     state: dict, vacated_iso: str, exclude_idx: int, s: Settings | None = None,
 ) -> dict | None:
