@@ -157,7 +157,8 @@ def today_strip_html(state: dict, config: dict) -> str:
 
 
 def todays_progress_html(state: dict, config: dict) -> tuple[str, str]:
-    """Returns (dots_html, summary_text) for today's posting progress."""
+    """Returns (dots_html, summary_text) for today's posting progress.
+    Summary includes total views on today's posted videos when available."""
     tz = ZoneInfo(config.get("schedule", {}).get("timezone", "UTC"))
     today = datetime.now(tz).date()
 
@@ -177,6 +178,7 @@ def todays_progress_html(state: dict, config: dict) -> tuple[str, str]:
     fired_only = 0
     queued = 0
     failed = 0
+    todays_views = 0
     dots_html = ""
     for slot, v in todays:
         if v.get("publish_failed"):
@@ -187,17 +189,21 @@ def todays_progress_html(state: dict, config: dict) -> tuple[str, str]:
             cls = "fired"; fired_only += 1
         else:
             cls = "queued"; queued += 1
+        a = v.get("analytics") or {}
+        if a.get("view_count"):
+            todays_views += int(a.get("view_count") or 0)
         title_attr = html_escape(slot.strftime('%-I:%M %p') + ' · ' + v.get("title", v.get("filename", "?"))[:60])
         dots_html += f'<span class="day-dot {cls}" title="{title_attr}"></span>'
 
     done = posted + fired_only
     total = len(todays)
+    views_part = f" · {todays_views:,} views" if todays_views else ""
     if queued > 0:
-        summary = f"{done}/{total} sent · {queued} more today"
+        summary = f"{done}/{total} sent · {queued} more today{views_part}"
     elif failed:
-        summary = f"{done}/{total} sent · {failed} failed"
+        summary = f"{done}/{total} sent · {failed} failed{views_part}"
     else:
-        summary = f"All {total} sent for today"
+        summary = f"All {total} sent for today{views_part}"
     return dots_html, summary
 
 
@@ -357,6 +363,18 @@ tr.next-up td:first-child::before {
 .progress-bar { height: 6px; background: var(--bg); border-radius: 3px; overflow: hidden; border: 1px solid var(--border); }
 .progress-bar .fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width 0.3s; }
 .progress-bar .fill.full { background: linear-gradient(90deg, var(--ok), #4ade80); }
+
+/* Add-channel ghost card */
+.card.card-add {
+  border-style: dashed; border-color: var(--border-strong);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  min-height: 100%; text-align: center; padding: 28px 18px;
+  color: var(--text-2); transition: border-color var(--transition), color var(--transition), background var(--transition);
+}
+.card-link:hover .card.card-add { color: var(--accent); border-color: var(--accent); background: var(--bg-2); transform: none; box-shadow: var(--shadow-1); }
+.card-add .add-glyph { font-size: 28px; line-height: 1; margin-bottom: 10px; font-weight: 300; opacity: 0.8; }
+.card-add .add-label { font-weight: 600; font-size: 14px; }
+.card-add .add-sub { font-size: 12px; color: var(--text-3); margin-top: 4px; }
 
 /* Today's progress dots on dashboard cards */
 .day-dots { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; margin-top: 4px; }
@@ -711,19 +729,13 @@ def dashboard():
         stats_full = channel_stats(state_full, config_full)
         health_cls, health_lbl = channel_health(stats_full, config_full, state_full, pb_ok)
 
-        last_posted_html = ""
+        last_posted_inline = "—"
         if c.get("last_posted_iso"):
             try:
                 ts_ms = int(datetime.fromisoformat(c["last_posted_iso"]).timestamp() * 1000)
-                last_posted_html = (
-                    f'<div class="muted-2" style="margin-top:6px;">'
-                    f'Last posted: <span data-when="{ts_ms}">…</span>'
-                    f'</div>'
-                )
+                last_posted_inline = f'Last: <span data-when="{ts_ms}">…</span>'
             except Exception:
                 pass
-        else:
-            last_posted_html = '<div class="muted-2" style="margin-top:6px;">Last posted: <em>never</em></div>'
 
         histo_html = fired_histogram_html(state_full, config_full)
         today_dots, today_summary = todays_progress_html(state_full, config_full)
@@ -740,19 +752,36 @@ def dashboard():
           <div class="card-row spread"><h3>{html_escape(c['name'])}</h3>
             <span class="health-pill {health_cls}">{html_escape(health_lbl)}</span>
           </div>
-          <div class="muted-2" style="margin-top:4px;">{html_escape(c['integration'])} · {html_escape(c['times'])}</div>
+          <div class="muted-2" style="margin-top:2px;">{html_escape(c['integration'])} · {html_escape(c['times'])}</div>
+
           {today_block}
+
           <div class="card-row" style="margin-top:14px;">
             <span class="stat"><strong data-stat="queued">{c['queued']}</strong> queued</span>
             <span class="stat"><strong data-stat="fired">{c['fired']}</strong> fired</span>
             <span class="stat"><strong data-stat="overdue">{c['overdue']}</strong> overdue</span>
           </div>
-          <div class="muted-2" style="margin-top:10px;">Next: <span data-stat="next">{html_escape(c['next_slot'] or '— nothing queued —')}</span></div>
-          {last_posted_html}
-          <div class="muted-2" style="margin-top:10px;">Last 7 days</div>
-          {histo_html}
+
+          <div class="muted-2" style="margin-top:14px; display:flex; justify-content:space-between; gap:10px;">
+            <span>Next: <span data-stat="next">{html_escape(c['next_slot'] or '—')}</span></span>
+            <span>{last_posted_inline}</span>
+          </div>
+
+          <div style="margin-top:14px;">
+            <div class="muted-2" style="margin-bottom:4px;">Last 7 days</div>
+            {histo_html}
+          </div>
         </div></a>
         """
+
+    # Add-channel ghost card at the end of the grid
+    cards_html += '''
+        <a class="card-link" href="/add"><div class="card card-add">
+          <div class="add-glyph">+</div>
+          <div class="add-label">Add channel</div>
+          <div class="add-sub">Connect a Post Bridge account</div>
+        </div></a>
+    '''
 
     if not cards:
         cards_html = """
